@@ -2,12 +2,12 @@
 
 > 个人自用项目，基于 Python + GTK4 编写的轻量级代码/文本记事本。
 
-![Foxnote](Foxnote.png)
+![foxnote](foxnote.png)
 
 ## 🎨 开源协议与版权说明
 
 - **代码开源协议**：MIT License（或个人使用，可按需修改）
-- **项目配图/图标**：`Foxnote.png` 遵循 **[CC BY-SA 4.0](http://creativecommons.org/licenses/by-sa/4.0/)** 协议开源。
+- **项目配图/图标**：`foxnote.png` 遵循 **[CC BY-SA 4.0](http://creativecommons.org/licenses/by-sa/4.0/)** 协议开源。
 [![CC BY-SA 4.0](https://licensebuttons.net/l/by-sa/4.0/88x31.png)](http://creativecommons.org/licenses/by-sa/4.0/)
 *(你可以自由共享、演绎此图片，但需保留原作者署名并以相同协议共享。)*
 
