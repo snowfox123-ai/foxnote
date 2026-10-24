@@ -1,633 +1,1246 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import sys
+import locale
+import tempfile
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gio, Gdk, GLib
+
+try:
+    gi.require_version("GtkSource", "5")
+    from gi.repository import GtkSource
+    HAS_SOURCE = True
+except (ValueError, ImportError):
+    HAS_SOURCE = False
 
 APP_NAME = "FoxNote"
-ICONS = ("foxnote.png", "icon.png")
+APP_ID = "org.foxnote.FoxNote"
 
 
+def _read_text(path):
+    """依次尝试 utf-8-sig / 系统编码 / 容错 utf-8。"""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        pass
+    try:
+        enc = locale.getpreferredencoding(False)
+        with open(path, "r", encoding=enc) as f:
+            return f.read()
+    except (UnicodeDecodeError, LookupError):
+        pass
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+# ---------------------------------------------------------------------------
+# 单个标签页 = 一个 Document
+# ---------------------------------------------------------------------------
 class Document:
-    """一个标签页对应一个 Document，持有自己的 Text / 路径 / 修改状态。"""
-
-    def __init__(self, app, notebook, path=None, content=""):
-        self.app = app
+    def __init__(self, window, path=None, content=""):
+        self.window = window
         self.path = path
-        self.modified = False
+        self.display_name = None
+        self.tab_label = None
 
-        self.frame = tk.Frame(notebook)
-        self.text = tk.Text(self.frame, undo=True, wrap="word", font=("Monospace", 12))
-        self.text.pack(side="left", fill="both", expand=True)
+        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled.set_hexpand(True)
+        self.scrolled.set_vexpand(True)
 
-        sb = tk.Scrollbar(self.frame, command=self.text.yview)
-        sb.pack(side="right", fill="y")
-        self.text.configure(yscrollcommand=sb.set)
+        if HAS_SOURCE:
+            self.buffer = GtkSource.Buffer()
+            self.buffer.set_enable_undo(True)
+            self.buffer.set_highlight_syntax(True)
+            self.buffer.set_highlight_matching_brackets(True)
+
+            self.view = GtkSource.View(buffer=self.buffer)
+            self.view.set_show_line_numbers(True)
+            self.view.set_highlight_current_line(True)
+            self.view.set_auto_indent(True)
+            self.view.set_tab_width(4)
+            self.view.set_insert_spaces_instead_of_tabs(True)
+        else:
+            self.buffer = Gtk.TextBuffer()
+            self.buffer.set_enable_undo(True)
+            self.view = Gtk.TextView(buffer=self.buffer)
+
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD)
+        self.view.set_monospace(True)
+        self.view.set_top_margin(6)
+        self.view.set_bottom_margin(6)
+        self.view.set_left_margin(8)
+        self.view.set_right_margin(8)
+
+        self.scrolled.set_child(self.view)
 
         if content:
-            self.text.insert("1.0", content)
-        self.text.edit_reset()          # 清掉插入内容产生的 undo 栈
-        self.text.edit_modified(False)  # 重置修改标记
-        self.text.mark_set("insert", "1.0")
+            self.buffer.set_text(content)
+        self.buffer.set_modified(False)
 
-        app._bind_text(self.text)
+        self.buffer.connect("modified-changed", self._on_modified_changed)
 
+        self._setup_context_menu()
+        self.update_language_for_path(path)
+        self.apply_style_scheme(window.dark)
 
-class FoxNote:
-    def __init__(self, root):
-        self.root = root
-        self.dark = False
-        self.docs = {}          # key = str(frame)，value = Document
+    def update_language_for_path(self, path):
+        if not HAS_SOURCE:
+            return
+        lm = GtkSource.LanguageManager.get_default()
+        lang = lm.guess_language(path) if path else None
+        self.buffer.set_language(lang)
 
-        root.geometry("800x600")
-        self._load_icon()
-        self._build_menu()
-        self._build_editor()
-        self._build_find_bar()
-        self._apply_theme()
-        self._update_title()
-
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        # 全局快捷键（文件、视图、查找）
-        root.bind_all("<Control-n>", self.new_file)
-        root.bind_all("<Control-t>", self.new_file)
-        root.bind_all("<Control-o>", self.open_file)
-        root.bind_all("<Control-s>", self.save_file)
-        root.bind_all("<Control-Shift-S>", self.save_as)
-        root.bind_all("<Control-w>", self.close_tab)
-        root.bind_all("<Control-d>", self.toggle_dark)
-        root.bind_all("<Control-f>", self.show_find)
-        root.bind_all("<Control-h>", self.show_replace)
-        root.bind_all("<F3>", self.find_next)
-        root.bind_all("<Shift-F3>", self.find_prev)
-
-    @property
-    def current_doc(self):
-        if not hasattr(self, "notebook"):
-            return None
-        sel = self.notebook.select()
-        if not sel:
-            return None
-        doc = self.docs.get(sel)
-        if doc:
-            return doc
-        for d in self.docs.values():
-            if str(d.frame) == sel:
-                return d
-        return None
-
-    @property
-    def text(self):
-        doc = self.current_doc
-        return doc.text if doc else None
-
-    @property
-    def current_file(self):
-        doc = self.current_doc
-        return doc.path if doc else None
-
-    @current_file.setter
-    def current_file(self, value):
-        doc = self.current_doc
-        if doc:
-            doc.path = value
-
-    @property
-    def modified(self):
-        doc = self.current_doc
-        return doc.modified if doc else False
-
-    @modified.setter
-    def modified(self, value):
-        doc = self.current_doc
-        if doc:
-            doc.modified = value
-
-    def _doc_of(self, widget):
-        for doc in self.docs.values():
-            if doc.text is widget:
-                return doc
-        return None
-
-    # ---- 图标 ----
-    def _load_icon(self):
-        for name in ICONS:
-            try:
-                self.icon = tk.PhotoImage(file=name)
-                self.root.iconphoto(True, self.icon)
+    def apply_style_scheme(self, dark):
+        if not HAS_SOURCE:
+            return
+        mgr = GtkSource.StyleSchemeManager.get_default()
+        candidates = ("Adwaita-dark", "oblivion", "solarized-dark") if dark else ("Adwaita", "classic", "solarized-light")
+        for sid in candidates:
+            scheme = mgr.get_scheme(sid)
+            if scheme is not None:
+                self.buffer.set_style_scheme(scheme)
                 return
-            except tk.TclError:
-                pass
 
-    # ---- 菜单 ----
+    def _on_modified_changed(self, buffer):
+        self.window._update_tab_title(self)
+        if self.window.get_current_doc() is self:
+            self.window._update_title()
+            self.window.status.set_text("已修改" if buffer.get_modified() else "就绪")
+
+    def cleanup(self):
+        try:
+            if self.popover.get_parent() is not None:
+                self.popover.unparent()
+        except Exception:
+            pass
+
+    def _setup_context_menu(self):
+        self.popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        self.popover.set_child(box)
+
+        def add(label, cb):
+            b = Gtk.Button(label=label)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _b: (self.popover.popdown(), cb()))
+            box.append(b)
+
+        def sep():
+            box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        add("撤销", self._undo)
+        add("重做", self._redo)
+        sep()
+        add("剪切", lambda: self.view.emit("cut-clipboard"))
+        add("复制", lambda: self.view.emit("copy-clipboard"))
+        add("粘贴", lambda: self.view.emit("paste-clipboard"))
+        add("全选", self._select_all)
+
+        gesture = Gtk.GestureClick()
+        gesture.set_button(3)
+        gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        gesture.connect("pressed", self._on_right_click)
+        self.view.add_controller(gesture)
+
+    def _on_right_click(self, gesture, n_press, x, y):
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+        bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        ok, over_iter = self.view.get_iter_at_location(bx, by)
+        if ok:
+            has_sel, s, e = self.buffer.get_selection_bounds()
+            if (not has_sel or over_iter.get_offset() < s.get_offset()
+                    or over_iter.get_offset() >= e.get_offset()):
+                self.buffer.place_cursor(over_iter)
+
+        if self.popover.get_parent() is None:
+            self.popover.set_parent(self.view)
+        if self.popover.get_visible():
+            self.popover.popdown()
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.popover.set_pointing_to(rect)
+        self.popover.popup()
+
+    def _undo(self):
+        try:
+            if self.buffer.get_can_undo():
+                self.buffer.undo()
+                self.view.grab_focus()
+        except Exception:
+            pass
+
+    def _redo(self):
+        try:
+            if self.buffer.get_can_redo():
+                self.buffer.redo()
+                self.view.grab_focus()
+        except Exception:
+            pass
+
+    def _select_all(self):
+        self.buffer.select_range(self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.view.grab_focus()
+
+
+# ---------------------------------------------------------------------------
+# 语言 ID → 保存时默认扩展名
+# ---------------------------------------------------------------------------
+LANG_EXT = {
+    "python":     ".py",
+    "html":       ".html",
+    "javascript": ".js",
+    "css":        ".css",
+    "markdown":   ".md",
+    "json":       ".json",
+    "xml":        ".xml",
+    "sh":         ".sh",
+    "c":          ".c",
+    "cpp":        ".cpp",
+    "rust":       ".rs",
+    "go":         ".go",
+}
+
+
+# ---------------------------------------------------------------------------
+# 主窗口
+# ---------------------------------------------------------------------------
+class FoxNoteWindow(Gtk.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(application=application)
+        self.application = application
+        self.docs = []
+        self.dark = False
+        self._pending_close = []
+
+        self.set_default_size(800, 600)
+        self.set_title(APP_NAME)
+
+        self._build_ui()
+        self._apply_theme()
+        self.connect("close-request", self._on_close_request)
+
+        self.new_file()
+        self._update_title()
+
+    def _build_ui(self):
+        header = Gtk.HeaderBar()
+        self.set_titlebar(header)
+
+        menu_btn = Gtk.MenuButton()
+        menu_btn.set_icon_name("open-menu-symbolic")
+        menu_btn.set_tooltip_text("菜单")
+        menu_btn.set_menu_model(self._build_menu())
+        header.pack_start(menu_btn)
+
+        for icon, tip, action in (
+            ("document-new-symbolic",  "新建 (Ctrl+N)", "app.new"),
+            ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
+            ("document-save-symbolic", "保存 (Ctrl+S)", "app.save"),
+        ):
+            btn = Gtk.Button(icon_name=icon)
+            btn.set_tooltip_text(tip)
+            btn.set_action_name(action)
+            header.pack_start(btn)
+
+        self.dark_btn = Gtk.ToggleButton(icon_name="weather-clear-night-symbolic")
+        self.dark_btn.set_tooltip_text("深色模式 (Ctrl+D)")
+        self.dark_btn.set_action_name("app.toggle-dark")
+        header.pack_end(self.dark_btn)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(vbox)
+
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_scrollable(True)
+        self.notebook.set_vexpand(True)
+        self.notebook.connect("switch-page", self._on_switch_page)
+        vbox.append(self.notebook)
+
+        self.find_revealer = Gtk.Revealer()
+        self.find_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        self.find_revealer.set_reveal_child(False)
+        self._build_find_bar()
+        vbox.append(self.find_revealer)
+
+        self.status = Gtk.Label(label="就绪")
+        if not HAS_SOURCE:
+            self.status.set_text("提示：未检测到 GtkSourceView，语法高亮与行号不可用。")
+        self.status.set_xalign(0)
+        self.status.set_margin_start(8)
+        self.status.set_margin_end(8)
+        self.status.set_margin_top(4)
+        self.status.set_margin_bottom(4)
+        vbox.append(self.status)
+
     def _build_menu(self):
-        bar = tk.Menu(self.root)
+        menu = Gio.Menu()
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="新建", accelerator="Ctrl+N", command=self.new_file)
-        m.add_command(label="打开...", accelerator="Ctrl+O", command=self.open_file)
-        m.add_command(label="保存", accelerator="Ctrl+S", command=self.save_file)
-        m.add_command(label="另存为...", accelerator="Ctrl+Shift+S", command=self.save_as)
-        m.add_separator()
-        m.add_command(label="关闭标签页", accelerator="Ctrl+W", command=self.close_tab)
-        m.add_command(label="退出", command=self.on_close)
-        bar.add_cascade(label="文件", menu=m)
+        sec = Gio.Menu()
+        sec.append("新建", "app.new")
+        sec.append("打开…", "app.open")
+        sec.append("保存", "app.save")
+        sec.append("另存为…", "app.save-as")
+        menu.append_section(None, sec)
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="撤销", accelerator="Ctrl+Z", command=self.undo)
-        m.add_command(label="重做", accelerator="Ctrl+Y", command=self.redo)
-        m.add_separator()
-        m.add_command(label="剪切", accelerator="Ctrl+X", command=self.cut)
-        m.add_command(label="复制", accelerator="Ctrl+C", command=self.copy)
-        m.add_command(label="粘贴", accelerator="Ctrl+V", command=self.paste)
-        m.add_command(label="全选", accelerator="Ctrl+A", command=self.select_all)
-        m.add_separator()
-        m.add_command(label="查找...", accelerator="Ctrl+F", command=self.show_find)
-        m.add_command(label="替换...", accelerator="Ctrl+H", command=self.show_replace)
-        m.add_command(label="查找下一个", accelerator="F3", command=self.find_next)
-        m.add_command(label="查找上一个", accelerator="Shift+F3", command=self.find_prev)
-        bar.add_cascade(label="编辑", menu=m)
+        sec = Gio.Menu()
+        sec.append("重命名标签页", "app.rename-tab")
+        sec.append("关闭标签页", "app.close-tab")
+        sec.append("退出", "app.quit")
+        menu.append_section(None, sec)
 
-        m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="深色模式", accelerator="Ctrl+D", command=self.toggle_dark)
-        bar.add_cascade(label="视图", menu=m)
+        sec = Gio.Menu()
+        sec.append("撤销", "app.undo")
+        sec.append("重做", "app.redo")
+        menu.append_section(None, sec)
 
-        self.root.config(menu=bar)
+        sec = Gio.Menu()
+        sec.append("剪切", "app.cut")
+        sec.append("复制", "app.copy")
+        sec.append("粘贴", "app.paste")
+        sec.append("全选", "app.select-all")
+        menu.append_section(None, sec)
 
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="撤销", command=self.undo)
-        self.context_menu.add_command(label="重做", command=self.redo)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="剪切", command=self.cut)
-        self.context_menu.add_command(label="复制", command=self.copy)
-        self.context_menu.add_command(label="粘贴", command=self.paste)
-        self.context_menu.add_command(label="全选", command=self.select_all)
+        sec = Gio.Menu()
+        sec.append("查找…", "app.show-find")
+        sec.append("替换…", "app.show-replace")
+        sec.append("查找下一个", "app.find-next")
+        sec.append("查找上一个", "app.find-prev")
+        menu.append_section(None, sec)
 
-    # ---- 编辑操作 ----
-    def undo(self, e=None):
-        try:
-            self.text.edit_undo()
-        except tk.TclError:
-            self.status.configure(text="没有可撤销的操作")
-        self.text.focus_set()
-        return "break"
+        if HAS_SOURCE:
+            sec = Gio.Menu()
+            lang_menu = Gio.Menu()
+            for name, lang_id in (("Python", "python"), ("HTML", "html"),
+                                  ("JavaScript", "javascript"), ("CSS", "css"),
+                                  ("Markdown", "markdown"), ("纯文本", "none")):
+                item = Gio.MenuItem.new(name, None)
+                item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
+                lang_menu.append_item(item)
+            sec.append_submenu("语法高亮", lang_menu)
+            menu.append_section(None, sec)
 
-    def redo(self, e=None):
-        try:
-            self.text.edit_redo()
-        except tk.TclError:
-            self.status.configure(text="没有可重做的操作")
-        self.text.focus_set()
-        return "break"
+        sec = Gio.Menu()
+        sec.append("深色模式", "app.toggle-dark")
+        menu.append_section(None, sec)
 
-    def cut(self, e=None):
-        self.text.focus_set()
-        try:
-            self.text.event_generate("<<Cut>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def copy(self, e=None):
-        self.text.focus_set()
-        try:
-            self.text.event_generate("<<Copy>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def paste(self, e=None):
-        self.text.focus_set()
-        try:
-            self.text.event_generate("<<Paste>>")
-        except tk.TclError:
-            pass
-        return "break"
-
-    def select_all(self, e=None):
-        self.text.tag_add("sel", "1.0", "end-1c")
-        self.text.mark_set("insert", "1.0")
-        self.text.see("insert")
-        self.text.focus_set()
-        return "break"
-
-    def _show_context_menu(self, event):
-        clicked = self.text.index(f"@{event.x},{event.y}")
-        try:
-            sel_start = self.text.index("sel.first")
-            sel_end = self.text.index("sel.last")
-            inside_selection = (
-                self.text.compare(clicked, ">=", sel_start)
-                and self.text.compare(clicked, "<", sel_end)
-            )
-        except tk.TclError:
-            inside_selection = False
-
-        if not inside_selection:
-            self.text.tag_remove("sel", "1.0", "end")
-            self.text.mark_set("insert", clicked)
-
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
-        return "break"
-
-    # ---- 主体 ----
-    def _build_editor(self):
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True)
-
-        self.status = tk.Label(self.root, text="就绪", anchor="w")
-        self.status.pack(side="bottom", fill="x")
-
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self._new_tab()
-
-    def _bind_text(self, text):
-        text.bind("<<Modified>>", self._on_modified)
-        text.bind("<Escape>", self._on_escape)
-        text.bind("<Control-a>", self.select_all)
-        text.bind("<Control-A>", self.select_all)
-        text.bind("<Control-z>", self.undo)
-        text.bind("<Control-Z>", self.undo)
-        text.bind("<Control-y>", self.redo)
-        text.bind("<Control-Y>", self.redo)
-        text.bind("<Control-x>", self.cut)
-        text.bind("<Control-X>", self.cut)
-        text.bind("<Control-c>", self.copy)
-        text.bind("<Control-C>", self.copy)
-        text.bind("<Control-v>", self.paste)
-        text.bind("<Control-V>", self.paste)
-        text.bind("<Button-3>", self._show_context_menu)
-
-    # ---- 标签页管理 ----
-    def _tab_title(self, doc):
-        name = os.path.basename(doc.path) if doc.path else "未命名"
-        return ("*" if doc.modified else "") + name
-
-    def _update_tab_title(self, doc):
-        try:
-            self.notebook.tab(doc.frame, text=self._tab_title(doc))
-        except tk.TclError:
-            pass
-
-    def _new_tab(self, path=None, content=""):
-        doc = Document(self, self.notebook, path, content)
-        key = str(doc.frame)
-        self.docs[key] = doc
-        self.notebook.add(doc.frame, text=self._tab_title(doc))
-        self.notebook.select(doc.frame)
-        self._apply_theme_to(doc)
-        self._update_title()
-        return doc
-
-    def _on_tab_changed(self, e=None):
-        self._clear_tags()
-        self._update_title()
-        if self.current_doc:
-            self.status.configure(text="就绪")
-
-    def close_tab(self, e=None):
-        doc = self.current_doc
-        if not doc:
-            return "break"
-        if doc.modified:
-            self.notebook.select(doc.frame)
-            if not messagebox.askyesno(
-                    "等等", f"{self._tab_title(doc)} 还没保存，确定要丢弃改动吗？"):
-                return "break"
-        key = str(doc.frame)
-        self.notebook.forget(doc.frame)
-        self.docs.pop(key, None)
-        doc.frame.destroy()
-        if not self.docs:
-            self._new_tab()
-        self._update_title()
-        self.status.configure(text="已关闭标签页")
-        return "break"
+        return menu
 
     def _build_find_bar(self):
-        self.find_frame = tk.Frame(self.root)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.set_margin_start(8)
+        outer.set_margin_end(8)
+        outer.set_margin_top(6)
+        outer.set_margin_bottom(6)
+        self.find_revealer.set_child(outer)
 
-        # -- 查找行 --
-        self.row_find = tk.Frame(self.find_frame)
-        self.row_find.pack(fill="x", pady=2)
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        outer.append(row1)
+        row1.append(Gtk.Label(label="查找"))
 
-        tk.Label(self.row_find, text="查找").pack(side="left", padx=(6, 2))
-        self.find_entry = tk.Entry(self.row_find, width=24)
-        self.find_entry.pack(side="left", fill="x", expand=True, padx=2)
+        self.find_entry = Gtk.Entry()
+        self.find_entry.set_hexpand(True)
+        self.find_entry.connect("activate", lambda e: self.find_next())
+        row1.append(self.find_entry)
 
-        self.case_var = tk.BooleanVar(value=False)
-        self.case_check = tk.Checkbutton(self.row_find, text="区分大小写", variable=self.case_var)
-        self.case_check.pack(side="left", padx=4)
+        self.case_check = Gtk.CheckButton(label="区分大小写")
+        row1.append(self.case_check)
 
-        tk.Button(self.row_find, text="上一个", command=self.find_prev).pack(side="left", padx=2)
-        tk.Button(self.row_find, text="下一个", command=self.find_next).pack(side="left", padx=2)
-        tk.Button(self.row_find, text="×", width=2, command=self.hide_find).pack(side="left", padx=(2, 6))
+        for label, cb in (("上一个", self.find_prev), ("下一个", self.find_next), ("×", self.hide_find)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            row1.append(b)
 
-        # -- 替换行 --
-        self.row_replace = tk.Frame(self.find_frame)
-        self.row_replace.pack(fill="x", pady=(0, 4))
+        self.row_replace = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        outer.append(self.row_replace)
+        self.row_replace.set_visible(False)
 
-        tk.Label(self.row_replace, text="替换").pack(side="left", padx=(6, 2))
-        self.replace_entry = tk.Entry(self.row_replace, width=24)
-        self.replace_entry.pack(side="left", fill="x", expand=True, padx=2)
+        self.row_replace.append(Gtk.Label(label="替换"))
+        self.replace_entry = Gtk.Entry()
+        self.replace_entry.set_hexpand(True)
+        self.replace_entry.connect("activate", lambda e: self.replace_one())
+        self.row_replace.append(self.replace_entry)
 
-        tk.Button(self.row_replace, text="替换", command=self.replace_one).pack(side="left", padx=2)
-        tk.Button(self.row_replace, text="全部替换", command=self.replace_all).pack(side="left", padx=2)
+        for label, cb in (("替换", self.replace_one), ("全部替换", self.replace_all)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            self.row_replace.append(b)
 
-        self.find_entry.bind("<Return>", self.find_next)
-        self.find_entry.bind("<Shift-Return>", self.find_prev)
-        self.find_entry.bind("<Escape>", self.hide_find)
-        self.find_entry.bind("<KeyRelease>", self._clear_tags)
-        self.replace_entry.bind("<Return>", self.replace_one)
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_find_key)
+        self.find_entry.add_controller(key_ctrl)
 
-    # ---- 配色 ----
-    def _colors(self):
-        if self.dark:
-            return dict(bg="#1e1e1e", fg="#d4d4d4", cursor="#ffffff",
-                        select="#264f78", status_bg="#2d2d2d", bar_bg="#252526")
-        return dict(bg="#ffffff", fg="#000000", cursor="#000000",
-                    select="#cce8ff", status_bg="#f0f0f0", bar_bg="#f0f0f0")
+    def _on_find_key(self, ctrl, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_find()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if state & Gdk.ModifierType.SHIFT_MASK:
+                self.find_prev()
+            else:
+                self.find_next()
+            return True
+        return False
 
     def _apply_theme(self):
-        c = self._colors()
-        self.status.configure(bg=c["status_bg"], fg=c["fg"])
+        settings = Gtk.Settings.get_default()
+        if settings:
+            settings.props.gtk_application_prefer_dark_theme = self.dark
+            try:
+                settings.set_property("gtk-interface-color-scheme",
+                                      "prefer-dark" if self.dark else "default")
+            except Exception:
+                pass
+        for doc in self.docs:
+            doc.apply_style_scheme(self.dark)
 
-        self.find_frame.configure(bg=c["bar_bg"])
-        self.row_find.configure(bg=c["bar_bg"])
-        self.row_replace.configure(bg=c["bar_bg"])
-        for row in (self.row_find, self.row_replace):
-            for w in row.winfo_children():
-                try:
-                    w.configure(bg=c["bar_bg"], fg=c["fg"])
-                except tk.TclError:
-                    pass
-
-        self.find_entry.configure(bg=c["bg"], fg=c["fg"], insertbackground=c["cursor"])
-        self.replace_entry.configure(bg=c["bg"], fg=c["fg"], insertbackground=c["cursor"])
-        self.case_check.configure(activebackground=c["bar_bg"], activeforeground=c["fg"],
-                                  selectcolor=c["bg"])
-
-        for doc in self.docs.values():
-            self._apply_theme_to(doc)
-
-    def _apply_theme_to(self, doc):
-        c = self._colors()
-        doc.frame.configure(bg=c["bg"])
-        doc.text.configure(bg=c["bg"], fg=c["fg"],
-                           insertbackground=c["cursor"],
-                           selectbackground=c["select"])
-        doc.text.tag_configure("hit", background="#ffb74d", foreground="#000000")
-
-    def toggle_dark(self, e=None):
+    def toggle_dark(self):
         self.dark = not self.dark
         self._apply_theme()
 
-    # ---- 修改标记 ----
-    def _on_modified(self, e=None):
-        w = e.widget if e is not None else self.text
-        doc = self._doc_of(w)
-        if doc is None:
-            return
-        if not w.edit_modified():
-            return
-        doc.modified = True
-        w.edit_modified(False)
-        w.tag_remove("hit", "1.0", "end")
-        self._update_tab_title(doc)
-        if doc is self.current_doc:
-            self._update_title()
-            self.status.configure(text="已修改")
+    def _display_name(self, doc):
+        if doc.path:
+            return os.path.basename(doc.path)
+        return doc.display_name or "未命名"
+
+    def _tab_title(self, doc):
+        mark = "*" if doc.buffer.get_modified() else ""
+        return f"{mark}{self._display_name(doc)}"
+
+    def _update_tab_title(self, doc):
+        if doc.tab_label is not None:
+            doc.tab_label.set_text(self._tab_title(doc))
+
+    def get_current_doc(self):
+        page = self.notebook.get_current_page()
+        if page < 0:
+            return None
+        child = self.notebook.get_nth_page(page)
+        for d in self.docs:
+            if d.scrolled is child:
+                return d
+        return None
+
+    def _on_switch_page(self, notebook, page, page_num):
+        self._update_title()
+        self.status.set_text("就绪")
+
+    def new_file(self):
+        self._new_tab()
+        self.status.set_text("新建文件")
+
+    def _new_tab(self, path=None, content=""):
+        doc = Document(self, path, content)
+        self.docs.append(doc)
+
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        doc.tab_label = Gtk.Label(label=self._tab_title(doc))
+        tab_box.append(doc.tab_label)
+
+        dbl = Gtk.GestureClick()
+        dbl.set_button(1)
+        dbl.connect("pressed", self._on_tab_double_click, doc)
+        doc.tab_label.add_controller(dbl)
+
+        close_btn = Gtk.Button(icon_name="window-close-symbolic")
+        close_btn.set_valign(Gtk.Align.CENTER)
+        close_btn.add_css_class("flat")
+        close_btn.set_tooltip_text("关闭标签页")
+        close_btn.connect("clicked", lambda _b, d=doc: self.close_tab_by_doc(d))
+        tab_box.append(close_btn)
+
+        self.notebook.append_page(doc.scrolled, tab_box)
+        self.notebook.set_current_page(self.notebook.get_n_pages() - 1)
+        doc.view.grab_focus()
+        self._update_title()
+        return doc
+
+    def _on_tab_double_click(self, gesture, n_press, x, y, doc):
+        if n_press == 2:
+            self.prompt_rename(doc)
 
     def _update_title(self):
-        doc = self.current_doc
-        name = os.path.basename(doc.path) if doc and doc.path else "未命名"
-        mark = "*" if doc and doc.modified else ""
-        self.root.title(f"{mark}{name} - {APP_NAME}")
+        doc = self.get_current_doc()
+        if doc:
+            mark = "*" if doc.buffer.get_modified() else ""
+            self.set_title(f"{mark}{self._display_name(doc)} - {APP_NAME}")
+        else:
+            self.set_title(APP_NAME)
 
-    # ---- 文件 ----
-    def new_file(self, e=None):
-        self._new_tab()
-        self.status.configure(text="新建文件")
-        return "break"
+    def close_tab(self):
+        doc = self.get_current_doc()
+        if doc:
+            self.close_tab_by_doc(doc)
 
-    def open_file(self, e=None):
-        path = filedialog.askopenfilename(
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
-        if not path:
-            return "break"
+    def close_tab_by_doc(self, doc):
+        if doc.buffer.get_modified():
+            self._ask_save_discard_cancel(
+                doc,
+                on_discard=lambda: self._do_close_tab(doc),
+                on_saved=lambda: self._do_close_tab(doc),
+            )
+        else:
+            self._do_close_tab(doc)
+
+    def _ask_save_discard_cancel(self, doc, on_discard, on_saved=None, on_cancel=None):
+        dlg = Gtk.Window(transient_for=self, modal=True)
+        dlg.set_title("未保存的更改")
+        dlg.set_default_size(350, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+        dlg.set_child(box)
+
+        label = Gtk.Label()
+        label.set_markup(f"<b>{self._tab_title(doc)} 还没保存</b>")
+        label.set_xalign(0)
+        box.append(label)
+
+        label2 = Gtk.Label(label="要保存改动吗？")
+        label2.set_xalign(0)
+        box.append(label2)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_halign(Gtk.Align.END)
+        box.append(btn_box)
+
+        def finish(response):
+            dlg.destroy()
+            if response == "discard":
+                on_discard()
+            elif response == "save":
+                self._save_doc(doc, on_saved or on_discard, on_cancel)
+            elif on_cancel:
+                on_cancel()
+
+        cancel_btn = Gtk.Button(label="取消")
+        cancel_btn.connect("clicked", lambda _b: finish("cancel"))
+        btn_box.append(cancel_btn)
+
+        discard_btn = Gtk.Button(label="丢弃")
+        discard_btn.connect("clicked", lambda _b: finish("discard"))
+        btn_box.append(discard_btn)
+
+        save_btn = Gtk.Button(label="保存")
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", lambda _b: finish("save"))
+        btn_box.append(save_btn)
+
+        dlg.connect("close-request", lambda w: finish("cancel"))
+        dlg.present()
+
+    def _save_doc(self, doc, on_success=None, on_cancel=None):
+        if doc is None:
+            return
+        if doc.path:
+            if self._save_to(doc, doc.path):
+                if on_success:
+                    on_success()
+            elif on_cancel:
+                on_cancel()
+        else:
+            self._save_as_doc(doc, on_success, on_cancel)
+
+    def _do_close_tab(self, doc):
+        doc.cleanup()
+        page = self.notebook.page_num(doc.scrolled)
+        if page >= 0:
+            self.notebook.remove_page(page)
+        if doc in self.docs:
+            self.docs.remove(doc)
+        if not self.docs:
+            self._new_tab()
+        self._update_title()
+        self.status.set_text("已关闭标签页")
+
+    def undo(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc._undo()
+
+    def redo(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc._redo()
+
+    def cut(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc.view.emit("cut-clipboard")
+
+    def copy(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc.view.emit("copy-clipboard")
+
+    def paste(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc.view.emit("paste-clipboard")
+
+    def select_all(self):
+        doc = self.get_current_doc()
+        if doc:
+            doc.buffer.select_range(doc.buffer.get_start_iter(), doc.buffer.get_end_iter())
+            doc.view.grab_focus()
+
+    def set_language(self, lang_id):
+        if not HAS_SOURCE:
+            return
+        doc = self.get_current_doc()
+        if not doc:
+            return
+        lm = GtkSource.LanguageManager.get_default()
+        if lang_id == "none":
+            doc.buffer.set_language(None)
+            self.status.set_text("已切换为纯文本")
+        else:
+            lang = lm.get_language(lang_id)
+            if lang:
+                doc.buffer.set_language(lang)
+                self.status.set_text(f"语法：{lang.get_name()}")
+
+    def prompt_rename(self, doc=None):
+        if doc is None:
+            doc = self.get_current_doc()
+        if doc is None:
+            return
+
+        dlg = Gtk.Window(transient_for=self, modal=True)
+        dlg.set_title("重命名")
+        dlg.set_default_size(320, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(14)
+        box.set_margin_bottom(14)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+        dlg.set_child(box)
+
+        if doc.path:
+            current = os.path.basename(doc.path)
+        else:
+            current = doc.display_name or "未命名"
+
+        entry = Gtk.Entry()
+        entry.set_text(current)
+        entry.select_region(0, -1)
+        box.append(entry)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_halign(Gtk.Align.END)
+        box.append(row)
+
+        def finish(ok):
+            if ok:
+                new_name = entry.get_text().strip()
+                if new_name and new_name != current:
+                    self._rename_doc(doc, new_name)
+            dlg.destroy()
+
+        cancel_btn = Gtk.Button(label="取消")
+        cancel_btn.connect("clicked", lambda _b: finish(False))
+        row.append(cancel_btn)
+
+        ok_btn = Gtk.Button(label="确定")
+        ok_btn.add_css_class("suggested-action")
+        ok_btn.connect("clicked", lambda _b: finish(True))
+        row.append(ok_btn)
+
+        entry.connect("activate", lambda _e: finish(True))
+        dlg.set_default_widget(ok_btn)
+        dlg.present()
+        entry.grab_focus()
+
+    def _rename_doc(self, doc, new_name):
+        if doc.path:
+            directory = os.path.dirname(doc.path)
+            new_path = os.path.join(directory, new_name)
+            if os.path.normpath(new_path) == os.path.normpath(doc.path):
+                return
+            if os.path.exists(new_path):
+                self._show_error("重命名失败", f"目标已存在：{new_path}")
+                return
+            try:
+                os.rename(doc.path, new_path)
+            except OSError as ex:
+                self._show_error("重命名失败", str(ex))
+                return
+            doc.path = new_path
+            doc.update_language_for_path(new_path)
+            doc.apply_style_scheme(self.dark)
+        else:
+            doc.display_name = new_name
+
+        self._update_tab_title(doc)
+        self._update_title()
+        self.status.set_text(f"已重命名为 {self._display_name(doc)}")
+
+    def open_file(self):
+        if hasattr(Gtk, "FileDialog"):
+            self._open_with_filedialog()
+        else:
+            self._open_with_choosernative()
+
+    def _open_with_filedialog(self):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("打开文件")
+
+        def on_done(d, result):
+            path = None
+            try:
+                file = d.open_finish(result)
+                if file:
+                    path = file.get_path()
+            except Exception:
+                pass
+            if not path:
+                return
+            try:
+                data = _read_text(path)
+            except OSError as ex:
+                self._show_error("打不开", str(ex))
+                return
+            self._open_path(path, data)
+
+        dialog.open(self, None, on_done)
+
+    def _open_with_choosernative(self):
+        dialog = Gtk.FileChooserNative.new("打开文件", self,
+                                           Gtk.FileChooserAction.OPEN, "打开", "取消")
+        filt = Gtk.FileFilter()
+        filt.set_name("文本 / 代码")
+        for p in ("*.txt", "*.md", "*.py", "*.html", "*.htm", "*.js",
+                  "*.css", "*.json", "*"):
+            filt.add_pattern(p)
+        dialog.add_filter(filt)
+        dialog.connect("response", self._on_open_response)
+        dialog.show()
+
+    def _on_open_response(self, dialog, response):
         try:
-            with open(path, encoding="utf-8") as f:
-                data = f.read()
-        except OSError as ex:
-            messagebox.showerror("打不开", str(ex))
-            return "break"
+            if response == Gtk.ResponseType.ACCEPT:
+                file = dialog.get_file()
+                if not file:
+                    return
+                path = file.get_path()
+                if not path:
+                    self._show_error("打不开", "目前只支持本地文件")
+                    return
+                try:
+                    data = _read_text(path)
+                except OSError as ex:
+                    self._show_error("打不开", str(ex))
+                    return
+                self._open_path(path, data)
+        finally:
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
 
-        doc = self.current_doc
-        if (doc and doc.path is None and not doc.modified
-                and not doc.text.get("1.0", "end-1c").strip()):
-            doc.text.delete("1.0", "end")
-            doc.text.insert("1.0", data)
-            doc.text.edit_reset()
-            doc.text.edit_modified(False)
+    def _open_path(self, path, data):
+        doc = self.get_current_doc()
+        empty = (
+            doc and doc.path is None and not doc.buffer.get_modified()
+            and not doc.buffer.get_text(doc.buffer.get_start_iter(),
+                                        doc.buffer.get_end_iter(), False).strip()
+        )
+        if empty:
+            doc.buffer.set_text(data)
+            doc.buffer.set_modified(False)
             doc.path = path
-            doc.modified = False
+            doc.display_name = None
+            doc.update_language_for_path(path)
+            doc.apply_style_scheme(self.dark)
             self._update_tab_title(doc)
         else:
             self._new_tab(path, data)
-
         self._update_title()
-        self.status.configure(text=f"打开 {path}")
-        return "break"
+        self.status.set_text(f"打开 {path}")
 
-    def save_file(self, e=None):
-        doc = self.current_doc
+    def save_file(self):
+        doc = self.get_current_doc()
         if not doc:
-            return "break"
+            return
         if doc.path:
-            self._save_to(doc.path, doc)
+            self._save_to(doc, doc.path)
         else:
-            self.save_as()
-        return "break"
+            self._save_as_doc(doc)
 
-    def save_as(self, e=None):
-        doc = self.current_doc
-        if not doc:
-            return "break"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
-        if path:
-            self._save_to(path, doc)
-        return "break"
+    def save_as(self):
+        doc = self.get_current_doc()
+        if doc:
+            self._save_as_doc(doc)
 
-    def _save_to(self, path, doc=None):
-        doc = doc or self.current_doc
-        if not doc:
-            return
-        data = doc.text.get("1.0", "end")
-        if data.endswith("\n"):
-            data = data[:-1]
+    def _default_ext(self, doc):
+        if not HAS_SOURCE:
+            return ".txt"
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(data)
-        except OSError as ex:
-            messagebox.showerror("存不了", str(ex))
+            lang = doc.buffer.get_language()
+        except Exception:
+            return ".txt"
+        if lang is None:
+            return ".txt"
+
+        ext = LANG_EXT.get(lang.get_id())
+        if ext:
+            return ext
+        try:
+            globs = lang.get_globs() or []
+        except Exception:
+            globs = []
+        if globs:
+            g = globs[0]
+            if g.startswith("*"):
+                return g[1:]
+        return ".txt"
+
+    def _make_save_filters(self, doc):
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        ext = self._default_ext(doc)
+
+        if ext != ".txt":
+            f1 = Gtk.FileFilter()
+            f1.set_name(f"当前语言 (*{ext})")
+            f1.add_pattern("*" + ext)
+            store.append(f1)
+        else:
+            f1 = None
+
+        f2 = Gtk.FileFilter()
+        f2.set_name("纯文本 (*.txt)")
+        f2.add_pattern("*.txt")
+        store.append(f2)
+
+        f3 = Gtk.FileFilter()
+        f3.set_name("所有文件")
+        f3.add_pattern("*")
+        store.append(f3)
+
+        default = f1 or f2
+        return store, default
+
+    def _save_as_doc(self, doc, on_success=None, on_cancel=None):
+        if doc is None:
             return
+        if doc.path:
+            default_name = os.path.basename(doc.path)
+        else:
+            base = doc.display_name or "未命名"
+            base, ext = os.path.splitext(base)
+            if not ext:
+                ext = self._default_ext(doc)   # ← 根据当前语法高亮决定扩展名
+            default_name = base + ext
+
+        if hasattr(Gtk, "FileDialog"):
+            self._save_as_filedialog(doc, default_name, on_success, on_cancel)
+        else:
+            self._save_as_choosernative(doc, default_name, on_success, on_cancel)
+
+    def _save_as_filedialog(self, doc, default_name, on_success, on_cancel):
+        dialog = Gtk.FileDialog()
+        dialog.set_title("另存为")
+        dialog.set_initial_name(default_name)
+
+        try:
+            store, default_filter = self._make_save_filters(doc)
+            dialog.set_filters(store)
+            dialog.set_default_filter(default_filter)
+        except Exception:
+            pass
+
+        def on_done(d, result):
+            path = None
+            try:
+                file = d.save_finish(result)
+                if file:
+                    path = file.get_path()
+            except Exception:
+                pass
+
+            if path:
+                if self._save_to(doc, path):
+                    if on_success:
+                        on_success()
+                elif on_cancel:
+                    on_cancel()
+            else:
+                if on_cancel:
+                    on_cancel()
+
+        dialog.save(self, None, on_done)
+
+    def _save_as_choosernative(self, doc, default_name, on_success, on_cancel):
+        dialog = Gtk.FileChooserNative.new("另存为", self,
+                                           Gtk.FileChooserAction.SAVE, "保存", "取消")
+        dialog.set_do_overwrite_confirmation(True)
+        dialog.set_current_name(default_name)
+
+        try:
+            store, default_filter = self._make_save_filters(doc)
+            for i in range(store.get_n_items()):
+                dialog.add_filter(store.get_item(i))
+            dialog.set_filter(default_filter)
+        except Exception:
+            pass
+
+        def resp(d, r):
+            path = None
+            try:
+                if r == Gtk.ResponseType.ACCEPT:
+                    file = d.get_file()
+                    if file:
+                        path = file.get_path()
+            finally:
+                try:
+                    d.destroy()
+                except Exception:
+                    pass
+            if path:
+                if self._save_to(doc, path):
+                    if on_success:
+                        on_success()
+                elif on_cancel:
+                    on_cancel()
+            else:
+                if on_cancel:
+                    on_cancel()
+
+        dialog.connect("response", resp)
+        dialog.show()
+
+    def _save_to(self, doc, path):
+        data = doc.buffer.get_text(doc.buffer.get_start_iter(),
+                                   doc.buffer.get_end_iter(), False)
+        try:
+            directory = os.path.dirname(os.path.abspath(path)) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".foxnote-", dir=directory, text=True)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(data)
+                if os.path.exists(path):
+                    try:
+                        os.chmod(tmp, os.stat(path).st_mode)
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as ex:
+            self._show_error("存不了", str(ex))
+            return False
+
         doc.path = path
-        doc.modified = False
+        doc.display_name = None
+        doc.buffer.set_modified(False)
+        doc.update_language_for_path(path)
+        doc.apply_style_scheme(self.dark)
         self._update_tab_title(doc)
         self._update_title()
-        self.status.configure(text=f"已保存到 {path}")
+        self.status.set_text(f"已保存到 {path}")
+        return True
 
-    def on_close(self):
-        for doc in list(self.docs.values()):
-            if doc.modified:
-                self.notebook.select(doc.frame)
-                self.root.update_idletasks()
-                if not messagebox.askyesno(
-                        "等等", f"{self._tab_title(doc)} 还没保存，确定要丢弃改动吗？"):
-                    return
-        self.root.destroy()
+    def _on_close_request(self, window):
+        if self._pending_close:
+            return True
 
-    # ---- 查找与替换 ----
-    def show_find(self, e=None):
-        if not self.find_frame.winfo_ismapped():
-            self.find_frame.pack(side="bottom", fill="x", before=self.status)
+        unsaved = [d for d in self.docs if d.buffer.get_modified()]
+        if not unsaved:
+            return False
 
-        if not hasattr(self, '_show_replace_mode'):
-            self._show_replace_mode = False
-        if not self._show_replace_mode:
-            self.row_replace.pack_forget()
+        self._pending_close = unsaved[:]
+        self._ask_next_close()
+        return True
 
+    def _ask_next_close(self):
+        if not self._pending_close:
+            self.destroy()
+            return
+
+        doc = self._pending_close[0]
+
+        def done():
+            if self._pending_close:
+                self._pending_close.pop(0)
+            self._ask_next_close()
+
+        def cancel():
+            self._pending_close.clear()
+
+        self._ask_save_discard_cancel(
+            doc,
+            on_discard=done,
+            on_saved=done,
+            on_cancel=cancel,
+        )
+
+    def show_find(self):
+        self.find_revealer.set_reveal_child(True)
+        self.row_replace.set_visible(False)
         self._prepare_find()
-        return "break"
 
-    def show_replace(self, e=None):
-        if not self.find_frame.winfo_ismapped():
-            self.find_frame.pack(side="bottom", fill="x", before=self.status)
-
-        self._show_replace_mode = True
-        self.row_replace.pack(fill="x", pady=(0, 4))
+    def show_replace(self):
+        self.find_revealer.set_reveal_child(True)
+        self.row_replace.set_visible(True)
         self._prepare_find()
-        self.replace_entry.focus_set()
-        return "break"
+        self.replace_entry.grab_focus()
 
     def _prepare_find(self):
-        if not self.find_entry.get():
-            try:
-                sel = self.text.get("sel.first", "sel.last")
-            except tk.TclError:
-                sel = ""
-            if sel and "\n" not in sel:
-                self.find_entry.insert(0, sel)
-        self.find_entry.focus_set()
-        self.find_entry.select_range(0, "end")
+        if not self.find_entry.get_text():
+            doc = self.get_current_doc()
+            if doc:
+                has_sel, s, e = doc.buffer.get_selection_bounds()
+                if has_sel:
+                    text = doc.buffer.get_text(s, e, False)
+                    if text and "\n" not in text:
+                        self.find_entry.set_text(text)
+        self.find_entry.grab_focus()
+        self.find_entry.select_region(0, -1)
 
-    def hide_find(self, e=None):
-        self.find_frame.pack_forget()
-        self._clear_tags()
-        self.text.focus_set()
-        return "break"
-
-    def _on_escape(self, e=None):
-        if self.find_frame.winfo_ismapped():
-            return self.hide_find()
-        return None
-
-    def _clear_tags(self, e=None):
-        doc = self.current_doc
+    def hide_find(self):
+        self.find_revealer.set_reveal_child(False)
+        doc = self.get_current_doc()
         if doc:
-            doc.text.tag_remove("hit", "1.0", "end")
+            doc.view.grab_focus()
 
-    def find_next(self, e=None):
-        return self._search(backwards=False)
+    def find_next(self):
+        self._search(False)
 
-    def find_prev(self, e=None):
-        return self._search(backwards=True)
+    def find_prev(self):
+        self._search(True)
 
-    def _search(self, backwards=False):
-        if not self.find_frame.winfo_ismapped():
-            return self.show_find()
-
-        term = self.find_entry.get()
-        if not term:
-            return "break"
-
-        nocase = not self.case_var.get()
-
-        if self.text.tag_ranges("hit"):
-            start = self.text.index("hit.first" if backwards else "hit.last")
-        else:
-            start = "insert"
-
-        if backwards:
-            pos = self.text.search(term, start, stopindex="1.0", backwards=True, nocase=nocase)
-            if not pos:
-                pos = self.text.search(term, "end", stopindex="1.0", backwards=True, nocase=nocase)
-        else:
-            pos = self.text.search(term, start, stopindex="end", nocase=nocase)
-            if not pos:
-                pos = self.text.search(term, "1.0", stopindex="end", nocase=nocase)
-
-        if not pos:
-            self._clear_tags()
-            self.status.configure(text=f"没找到 {term}")
-            return "break"
-
-        end = f"{pos}+{len(term)}c"
-        self._clear_tags()
-        self.text.tag_add("hit", pos, end)
-        self.text.mark_set("insert", end)
-        self.text.see(pos)
-        return "break"
-
-    def replace_one(self, e=None):
-        if not self.text.tag_ranges("hit"):
-            self.find_next()
-            return "break"
-
-        pos_start = self.text.index("hit.first")
-        pos_end = self.text.index("hit.last")
-        repl = self.replace_entry.get()
-
-        self.text.delete(pos_start, pos_end)
-        self.text.insert(pos_start, repl)
-
-        self._clear_tags()
-        self.find_next()
-        return "break"
-
-    def replace_all(self):
-        term = self.find_entry.get()
-        repl = self.replace_entry.get()
+    def _search(self, backwards):
+        doc = self.get_current_doc()
+        if not doc:
+            return
+        if not self.find_revealer.get_reveal_child():
+            self.find_revealer.set_reveal_child(True)
+            self._prepare_find()
+        term = self.find_entry.get_text()
         if not term:
             return
 
-        nocase = not self.case_var.get()
+        buffer = doc.buffer
+        flags = Gtk.TextSearchFlags(0)
+        if not self.case_check.get_active():
+            flags |= Gtk.TextSearchFlags.CASE_INSENSITIVE
+
+        has_sel, s, e = buffer.get_selection_bounds()
+        result = None
+        if has_sel:
+            if backwards:
+                result = s.backward_search(term, flags, buffer.get_start_iter())
+                if not result:
+                    result = buffer.get_end_iter().backward_search(term, flags, buffer.get_start_iter())
+            else:
+                result = e.forward_search(term, flags, buffer.get_end_iter())
+                if not result:
+                    result = buffer.get_start_iter().forward_search(term, flags, buffer.get_end_iter())
+        else:
+            cursor = buffer.get_iter_at_mark(buffer.get_insert())
+            if backwards:
+                result = cursor.backward_search(term, flags, buffer.get_start_iter())
+                if not result:
+                    result = buffer.get_end_iter().backward_search(term, flags, buffer.get_start_iter())
+            else:
+                result = cursor.forward_search(term, flags, buffer.get_end_iter())
+                if not result:
+                    result = buffer.get_start_iter().forward_search(term, flags, buffer.get_end_iter())
+
+        if not result:
+            self.status.set_text(f"没找到 {term}")
+            return
+
+        m_start, m_end = result
+        buffer.select_range(m_start, m_end)
+        doc.view.scroll_to_iter(m_start, 0.0, False, 0.0, 0.0)
+
+    def replace_one(self):
+        doc = self.get_current_doc()
+        if not doc:
+            return
+        term = self.find_entry.get_text()
+        if not term:
+            return
+        buffer = doc.buffer
+        repl = self.replace_entry.get_text()
+        has_sel, s, e = buffer.get_selection_bounds()
+        if has_sel:
+            sel = buffer.get_text(s, e, False)
+            if self.case_check.get_active():
+                matched = (sel == term)
+            else:
+                matched = (sel.lower() == term.lower())
+            if matched:
+                offset = s.get_offset()
+                buffer.begin_user_action()
+                buffer.delete(s, e)
+                new_iter = buffer.get_iter_at_offset(offset)
+                buffer.insert(new_iter, repl)
+                buffer.end_user_action()
+        self.find_next()
+
+    def replace_all(self):
+        doc = self.get_current_doc()
+        if not doc:
+            return
+        term = self.find_entry.get_text()
+        if not term:
+            return
+        repl = self.replace_entry.get_text()
+        buffer = doc.buffer
+
+        flags = Gtk.TextSearchFlags(0)
+        if not self.case_check.get_active():
+            flags |= Gtk.TextSearchFlags.CASE_INSENSITIVE
+
         count = 0
-        insert_mark = self.text.index("insert")
-        start = "1.0"
-
+        buffer.begin_user_action()
+        start = buffer.get_start_iter()
         while True:
-            pos = self.text.search(term, start, stopindex="end", nocase=nocase)
-            if not pos:
+            result = start.forward_search(term, flags, buffer.get_end_iter())
+            if not result:
                 break
-            end = f"{pos}+{len(term)}c"
-            self.text.delete(pos, end)
-            self.text.insert(pos, repl)
-            start = f"{pos}+{len(repl)}c"
+            m_start, m_end = result
+            offset = m_start.get_offset()
+            buffer.delete(m_start, m_end)
+            new_iter = buffer.get_iter_at_offset(offset)
+            buffer.insert(new_iter, repl)
+            start = buffer.get_iter_at_offset(offset + len(repl))
             count += 1
+        buffer.end_user_action()
+        self.status.set_text(f"替换了 {count} 处")
 
-        self.text.mark_set("insert", insert_mark)
-        self._clear_tags()
-        self.status.configure(text=f"替换了 {count} 处")
+    def _show_error(self, title, msg):
+        dlg = Gtk.Window(transient_for=self, modal=True)
+        dlg.set_title(title)
+        dlg.set_default_size(350, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+        dlg.set_child(box)
+
+        label = Gtk.Label()
+        label.set_markup(f"<b>{title}</b>")
+        label.set_xalign(0)
+        box.append(label)
+
+        label2 = Gtk.Label(label=msg)
+        label2.set_xalign(0)
+        label2.set_wrap(True)
+        box.append(label2)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        btn_box.set_halign(Gtk.Align.END)
+        box.append(btn_box)
+
+        close_btn = Gtk.Button(label="关闭")
+        close_btn.add_css_class("suggested-action")
+        close_btn.connect("clicked", lambda _b: dlg.destroy())
+        btn_box.append(close_btn)
+
+        dlg.connect("close-request", lambda w: (w.destroy(), True))
+        dlg.present()
+
+
+# ---------------------------------------------------------------------------
+# 应用
+# ---------------------------------------------------------------------------
+class FoxNoteApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self._setup_actions()
+        self._setup_accels()
+
+    def _setup_actions(self):
+        def bind(name, fn):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda a, p: fn(self.props.active_window))
+            self.add_action(act)
+
+        bind("new",         lambda w: w.new_file()      if w else None)
+        bind("open",        lambda w: w.open_file()     if w else None)
+        bind("save",        lambda w: w.save_file()     if w else None)
+        bind("save-as",     lambda w: w.save_as()       if w else None)
+        bind("close-tab",   lambda w: w.close_tab()     if w else None)
+        bind("rename-tab",  lambda w: w.prompt_rename() if w else None)
+        bind("quit",        lambda w: self.quit())
+        bind("undo",        lambda w: w.undo()          if w else None)
+        bind("redo",        lambda w: w.redo()          if w else None)
+        bind("cut",         lambda w: w.cut()           if w else None)
+        bind("copy",        lambda w: w.copy()          if w else None)
+        bind("paste",       lambda w: w.paste()         if w else None)
+        bind("select-all",  lambda w: w.select_all()    if w else None)
+        bind("show-find",   lambda w: w.show_find()     if w else None)
+        bind("show-replace",lambda w: w.show_replace()  if w else None)
+        bind("find-next",   lambda w: w.find_next()     if w else None)
+        bind("find-prev",   lambda w: w.find_prev()     if w else None)
+
+        dark = Gio.SimpleAction.new_stateful(
+            "toggle-dark", None, GLib.Variant.new_boolean(False)
+        )
+        dark.connect("activate", self._on_toggle_dark)
+        self.add_action(dark)
+
+        act = Gio.SimpleAction.new("set-lang", GLib.VariantType.new("s"))
+        act.connect("activate", lambda a, p: (
+            self.props.active_window.set_language(p.get_string())
+            if self.props.active_window else None
+        ))
+        self.add_action(act)
+
+    def _on_toggle_dark(self, action, param):
+        win = self.props.active_window
+        if win:
+            win.toggle_dark()
+            action.set_state(GLib.Variant.new_boolean(win.dark))
+
+    def _setup_accels(self):
+        self.set_accels_for_action("app.new",          ["<Ctrl>N"])
+        self.set_accels_for_action("app.open",         ["<Ctrl>O"])
+        self.set_accels_for_action("app.save",         ["<Ctrl>S"])
+        self.set_accels_for_action("app.save-as",      ["<Ctrl><Shift>S"])
+        self.set_accels_for_action("app.rename-tab",   ["F2"])
+        self.set_accels_for_action("app.close-tab",    ["<Ctrl>W"])
+        self.set_accels_for_action("app.quit",         ["<Ctrl>Q"])
+        self.set_accels_for_action("app.toggle-dark",  ["<Ctrl>D"])
+        self.set_accels_for_action("app.show-find",    ["<Ctrl>F"])
+        self.set_accels_for_action("app.show-replace", ["<Ctrl>H"])
+        self.set_accels_for_action("app.find-next",    ["F3"])
+        self.set_accels_for_action("app.find-prev",    ["<Shift>F3"])
+
+    def do_activate(self):
+        win = self.props.active_window
+        if not win:
+            win = FoxNoteWindow(application=self)
+        win.present()
+
+
+def main():
+    return FoxNoteApp().run(sys.argv)
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    FoxNote(root)
-    root.mainloop()
+    sys.exit(main())
