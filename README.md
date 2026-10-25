@@ -6,9 +6,9 @@
 
 ## 🎨 开源协议与版权说明
 
-- **代码开源协议**：MIT License（或个人使用，可按需修改）
-- **项目配图/图标**：`foxnote.png` 遵循 **"作者已放弃该图片的所有版权，将其贡献至公共领域。您可以自由复制、修改、分发，甚至用于商业目的，无需署名。"
-## ✨ 项目说明 / 功能特性[![CC0](https://licensebuttons.net/p/zero/1.0/88x31.png)](https://creativecommons.org/publicdomain/zero/1.0/)
+- - **代码开源协议**: MIT License (或个人使用，可按需修改)
+- **项目配图/图标**: `foxnote.png` 遵循 [![CC0](https://licensebuttons.net/p/zero/1.0/88x31.png)](https://creativecommons.org/publicdomain/zero/1.0/) 协议。
+  作者已放弃该图片的所有版权，将其贡献至公共领域。您可以自由复制、修改、分发，甚至用于商业目的，无需署名。
 
 - 基于 GTK4 和 GtkSourceView 5，原生 Linux 体验。
 - 支持多标签页（Tab）编辑。
