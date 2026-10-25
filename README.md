@@ -7,11 +7,8 @@
 ## 🎨 开源协议与版权说明
 
 - **代码开源协议**：MIT License（或个人使用，可按需修改）
-- **项目配图/图标**：`foxnote.png` 遵循 **[CC BY-SA 4.0](http://creativecommons.org/licenses/by-sa/4.0/)** 协议开源。
-[![CC BY-SA 4.0](https://licensebuttons.net/l/by-sa/4.0/88x31.png)](http://creativecommons.org/licenses/by-sa/4.0/)
-*(你可以自由共享、演绎此图片，但需保留原作者署名并以相同协议共享。)*
-
-## ✨ 项目说明 / 功能特性
+- **项目配图/图标**：`foxnote.png` 遵循 **"作者已放弃该图片的所有版权，将其贡献至公共领域。您可以自由复制、修改、分发，甚至用于商业目的，无需署名。"
+## ✨ 项目说明 / 功能特性[![CC0](https://licensebuttons.net/p/zero/1.0/88x31.png)](https://creativecommons.org/publicdomain/zero/1.0/)
 
 - 基于 GTK4 和 GtkSourceView 5，原生 Linux 体验。
 - 支持多标签页（Tab）编辑。
@@ -29,7 +26,9 @@
 sudo apt update
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-gtksource-5
 ```
+```bash
 python3 foxnote.py
+```
 🚧 待办 / 更新日志 (Todo)
 
     ☑
