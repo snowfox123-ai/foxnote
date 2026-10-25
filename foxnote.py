@@ -193,11 +193,13 @@ class Document:
 
 # ---------------------------------------------------------------------------
 # 语言 ID → 保存时默认扩展名
+# 注意:GtkSourceView 5 的语言 id 常和显示名不一致,如 JavaScript 的 id 是 "js"
 # ---------------------------------------------------------------------------
 LANG_EXT = {
     "python":     ".py",
     "html":       ".html",
     "javascript": ".js",
+    "js":         ".js",
     "css":        ".css",
     "markdown":   ".md",
     "json":       ".json",
@@ -319,8 +321,9 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if HAS_SOURCE:
             sec = Gio.Menu()
             lang_menu = Gio.Menu()
+            # 注意:JavaScript 在 GtkSourceView 5 中的语言 id 是 "js"
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
-                                  ("JavaScript", "javascript"), ("CSS", "css"),
+                                  ("JavaScript", "js"), ("CSS", "css"),
                                   ("Markdown", "markdown"), ("纯文本", "none")):
                 item = Gio.MenuItem.new(name, None)
                 item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
@@ -602,14 +605,29 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if not doc:
             return
         lm = GtkSource.LanguageManager.get_default()
+
         if lang_id == "none":
             doc.buffer.set_language(None)
             self.status.set_text("已切换为纯文本")
+            return
+
+        lang = lm.get_language(lang_id)
+        # 兜底:若按 id 找不到,再按"语言名"忽略大小写匹配一次
+        if lang is None:
+            target = lang_id.lower()
+            for lid in lm.get_language_ids():
+                cand = lm.get_language(lid)
+                if cand is None:
+                    continue
+                if cand.get_name().lower() == target or lid.lower() == target:
+                    lang = cand
+                    break
+
+        if lang:
+            doc.buffer.set_language(lang)
+            self.status.set_text(f"语法：{lang.get_name()}")
         else:
-            lang = lm.get_language(lang_id)
-            if lang:
-                doc.buffer.set_language(lang)
-                self.status.set_text(f"语法：{lang.get_name()}")
+            self.status.set_text(f"未找到语言：{lang_id}")
 
     def prompt_rename(self, doc=None):
         if doc is None:
@@ -835,14 +853,15 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
     def _save_as_doc(self, doc, on_success=None, on_cancel=None):
         if doc is None:
             return
+
+        # 默认文件名:basename 不变,但扩展名始终跟随当前语法高亮
         if doc.path:
-            default_name = os.path.basename(doc.path)
+            base = os.path.splitext(os.path.basename(doc.path))[0]
         else:
             base = doc.display_name or "未命名"
-            base, ext = os.path.splitext(base)
-            if not ext:
-                ext = self._default_ext(doc)   # ← 根据当前语法高亮决定扩展名
-            default_name = base + ext
+            base = os.path.splitext(base)[0]
+        ext = self._default_ext(doc)
+        default_name = base + ext
 
         if hasattr(Gtk, "FileDialog"):
             self._save_as_filedialog(doc, default_name, on_success, on_cancel)
