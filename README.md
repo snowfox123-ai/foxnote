@@ -19,9 +19,26 @@
 - 采用了原子写入（临时文件替换）防止保存崩溃导致文件损坏。
 
 ## 🚀 运行方式
+### 方式一：一键安装（推荐）
+我们提供了一键安装脚本，脚本会自动安装依赖、将程序文件拷贝到系统目录，并创建桌面快捷方式：
 
-在 Debian/Ubuntu 等系统上，需要先安装依赖：
+```bash
+# 赋予脚本执行权限
+chmod +x install.sh
 
+# 运行安装脚本（需要管理员权限）
+sudo ./install.sh
+# 然后运行
+foxnote
+```
+如果你想卸载，请运行
+```bash
+./install.sh --uninstall
+```
+
+需要先安装依赖：
+###方式二：源码手动运行
+如果您不想安装到系统中，只想在终端直接运行，请先安装环境依赖：
 ```bash
 sudo apt update
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-gtksource-5
@@ -29,26 +46,3 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-gtksource-5
 ```bash
 python3 foxnote.py
 ```
-🚧 待办 / 更新日志 (Todo)
-
-    ☑
-
-    初始化项目并上传代码
-    ☑
-
-    更新 README
-    ☑
-
-    修复撤销回退后 * 标记不消失的 Bug
-    ☑
-
-    修复远程/特殊文件路径获取失败的崩溃问题
-    ☑
-
-    深色模式改用 stateful action，状态同步更完美
-    ☑
-
-    替换功能增加选区校验，防止误替换
-    □
-
-    后续功能修改记在这里...

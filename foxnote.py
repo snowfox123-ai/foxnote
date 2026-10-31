@@ -4,6 +4,7 @@ import os
 import sys
 import locale
 import tempfile
+import re
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -156,9 +157,13 @@ class Document:
         bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
         ok, over_iter = self.view.get_iter_at_location(bx, by)
         if ok:
-            has_sel, s, e = self.buffer.get_selection_bounds()
-            if (not has_sel or over_iter.get_offset() < s.get_offset()
-                    or over_iter.get_offset() >= e.get_offset()):
+            bounds = self.buffer.get_selection_bounds()
+            if bounds:
+                _, s, e = bounds
+                if (over_iter.get_offset() < s.get_offset()
+                        or over_iter.get_offset() >= e.get_offset()):
+                    self.buffer.place_cursor(over_iter)
+            else:
                 self.buffer.place_cursor(over_iter)
 
         if self.popover.get_parent() is None:
@@ -204,6 +209,7 @@ LANG_EXT = {
     "markdown":   ".md",
     "json":       ".json",
      "sql":        ".sql",
+     "sh":         ".sh"
 }
 
 
@@ -319,7 +325,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             # 注意:JavaScript 在 GtkSourceView 5 中的语言 id 是 "js"
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
                                   ("JavaScript", "js"), ("CSS", "css"),
-                                  ("JSON", "json"), ("SQL", "sql"), 
+                                  ("JSON", "json"), ("SQL", "sql"),
+                                  ("Shell", "sh"), 
                                   ("Markdown", "markdown"), ("纯文本", "none")):
                 item = Gio.MenuItem.new(name, None)
                 item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
@@ -1020,8 +1027,9 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if not self.find_entry.get_text():
             doc = self.get_current_doc()
             if doc:
-                has_sel, s, e = doc.buffer.get_selection_bounds()
-                if has_sel:
+                bounds = doc.buffer.get_selection_bounds()
+                if bounds:
+                    _, s, e = bounds
                     text = doc.buffer.get_text(s, e, False)
                     if text and "\n" not in text:
                         self.find_entry.set_text(text)
@@ -1056,7 +1064,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if not self.case_check.get_active():
             flags |= Gtk.TextSearchFlags.CASE_INSENSITIVE
 
-        has_sel, s, e = buffer.get_selection_bounds()
+        bounds = buffer.get_selection_bounds()
+        if bounds:
+            has_sel, s, e = bounds
+        else:
+            has_sel = False
+
         result = None
         if has_sel:
             if backwards:
@@ -1095,8 +1108,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             return
         buffer = doc.buffer
         repl = self.replace_entry.get_text()
-        has_sel, s, e = buffer.get_selection_bounds()
-        if has_sel:
+        
+        bounds = buffer.get_selection_bounds()
+        if bounds:
+            has_sel, s, e = bounds
             sel = buffer.get_text(s, e, False)
             if self.case_check.get_active():
                 matched = (sel == term)
@@ -1121,26 +1136,34 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         repl = self.replace_entry.get_text()
         buffer = doc.buffer
 
-        flags = Gtk.TextSearchFlags(0)
-        if not self.case_check.get_active():
-            flags |= Gtk.TextSearchFlags.CASE_INSENSITIVE
+        # 获取当前选区，如果有选区，则只替换选区内容（防止误替换）
+        bounds = buffer.get_selection_bounds()
+        if bounds:
+            start = bounds[1]
+            end = bounds[2]
+        else:
+            start = buffer.get_start_iter()
+            end = buffer.get_end_iter()
 
-        count = 0
-        buffer.begin_user_action()
-        start = buffer.get_start_iter()
-        while True:
-            result = start.forward_search(term, flags, buffer.get_end_iter())
-            if not result:
-                break
-            m_start, m_end = result
-            offset = m_start.get_offset()
-            buffer.delete(m_start, m_end)
+        # 获取要替换的文本段
+        text = buffer.get_text(start, end, False)
+        
+        # 使用正则进行替换（忽略大小写或不忽略）
+        flags = re.IGNORECASE if not self.case_check.get_active() else 0
+        pattern = re.compile(re.escape(term), flags)
+        new_text, count = pattern.subn(repl, text)
+
+        if count > 0:
+            # 记录起始偏移量，用于插入替换后的文本
+            offset = start.get_offset()
+            buffer.begin_user_action()
+            buffer.delete(start, end)
             new_iter = buffer.get_iter_at_offset(offset)
-            buffer.insert(new_iter, repl)
-            start = buffer.get_iter_at_offset(offset + len(repl))
-            count += 1
-        buffer.end_user_action()
-        self.status.set_text(f"替换了 {count} 处")
+            buffer.insert(new_iter, new_text)
+            buffer.end_user_action()
+            self.status.set_text(f"替换了 {count} 处")
+        else:
+            self.status.set_text("未找到匹配项")
 
     def _show_error(self, title, msg):
         dlg = Gtk.Window(transient_for=self, modal=True)
