@@ -36,8 +36,7 @@ foxnote
 ./install.sh --uninstall
 ```
 
-需要先安装依赖：
-###方式二：源码手动运行
+### 方式二：源码手动运行
 如果您不想安装到系统中，只想在终端直接运行，请先安装环境依赖：
 ```bash
 sudo apt update
