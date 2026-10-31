@@ -27,7 +27,7 @@
 chmod +x install.sh
 
 # 运行安装脚本（需要管理员权限）
-sudo ./install.sh
+./install.sh
 # 然后运行
 foxnote
 ```
