@@ -203,12 +203,7 @@ LANG_EXT = {
     "css":        ".css",
     "markdown":   ".md",
     "json":       ".json",
-    "xml":        ".xml",
-    "sh":         ".sh",
-    "c":          ".c",
-    "cpp":        ".cpp",
-    "rust":       ".rs",
-    "go":         ".go",
+     "sql":        ".sql",
 }
 
 
@@ -324,11 +319,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             # 注意:JavaScript 在 GtkSourceView 5 中的语言 id 是 "js"
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
                                   ("JavaScript", "js"), ("CSS", "css"),
+                                  ("JSON", "json"), ("SQL", "sql"), 
                                   ("Markdown", "markdown"), ("纯文本", "none")):
                 item = Gio.MenuItem.new(name, None)
                 item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
                 lang_menu.append_item(item)
-            sec.append_submenu("语法高亮", lang_menu)
+            sec.append_submenu("语言", lang_menu)
             menu.append_section(None, sec)
 
         sec = Gio.Menu()
