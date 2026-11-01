@@ -5,6 +5,7 @@ import sys
 import locale
 import tempfile
 import re
+import subprocess
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -157,9 +158,13 @@ class Document:
         bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
         ok, over_iter = self.view.get_iter_at_location(bx, by)
         if ok:
-            bounds = self.buffer.get_selection_bounds()
-            if bounds:
-                _, s, e = bounds
+            # 修复解包崩溃问题
+            if self.buffer.get_has_selection():
+                bounds = self.buffer.get_selection_bounds()
+                if len(bounds) == 3:
+                    _, s, e = bounds
+                else:
+                    s, e = bounds
                 if (over_iter.get_offset() < s.get_offset()
                         or over_iter.get_offset() >= e.get_offset()):
                     self.buffer.place_cursor(over_iter)
@@ -198,7 +203,6 @@ class Document:
 
 # ---------------------------------------------------------------------------
 # 语言 ID → 保存时默认扩展名
-# 注意:GtkSourceView 5 的语言 id 常和显示名不一致,如 JavaScript 的 id 是 "js"
 # ---------------------------------------------------------------------------
 LANG_EXT = {
     "python":     ".py",
@@ -208,8 +212,8 @@ LANG_EXT = {
     "css":        ".css",
     "markdown":   ".md",
     "json":       ".json",
-     "sql":        ".sql",
-     "sh":         ".sh"
+    "sql":        ".sql",
+    "sh":         ".sh"
 }
 
 
@@ -248,6 +252,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             ("document-new-symbolic",  "新建 (Ctrl+N)", "app.new"),
             ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
             ("document-save-symbolic", "保存 (Ctrl+S)", "app.save"),
+            ("document-print-symbolic", "打印 (Ctrl+P)", "app.print"),
         ):
             btn = Gtk.Button(icon_name=icon)
             btn.set_tooltip_text(tip)
@@ -292,6 +297,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         sec.append("打开…", "app.open")
         sec.append("保存", "app.save")
         sec.append("另存为…", "app.save-as")
+        sec.append("打印…", "app.print")
         menu.append_section(None, sec)
 
         sec = Gio.Menu()
@@ -322,7 +328,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if HAS_SOURCE:
             sec = Gio.Menu()
             lang_menu = Gio.Menu()
-            # 注意:JavaScript 在 GtkSourceView 5 中的语言 id 是 "js"
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
                                   ("JavaScript", "js"), ("CSS", "css"),
                                   ("JSON", "json"), ("SQL", "sql"),
@@ -615,7 +620,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             return
 
         lang = lm.get_language(lang_id)
-        # 兜底:若按 id 找不到,再按"语言名"忽略大小写匹配一次
         if lang is None:
             target = lang_id.lower()
             for lid in lm.get_language_ids():
@@ -804,6 +808,19 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         doc = self.get_current_doc()
         if doc:
             self._save_as_doc(doc)
+    def print_doc(self):
+        doc = self.get_current_doc()
+        if not doc:
+            return
+        data = doc.buffer.get_text(doc.buffer.get_start_iter(),
+                                   doc.buffer.get_end_iter(), False)
+        try:
+            subprocess.run(["lp"], input=data.encode("utf-8"), check=True)
+            self.status.set_text("已发送到打印队列")
+        except FileNotFoundError:
+            self._show_error("打印失败", "系统里找不到 lp 命令（需要 CUPS）。")
+        except subprocess.CalledProcessError as ex:
+            self._show_error("打印失败", f"lp 返回错误：{ex}")
 
     def _default_ext(self, doc):
         if not HAS_SOURCE:
@@ -857,7 +874,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if doc is None:
             return
 
-        # 默认文件名:basename 不变,但扩展名始终跟随当前语法高亮
         if doc.path:
             base = os.path.splitext(os.path.basename(doc.path))[0]
         else:
@@ -1027,9 +1043,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if not self.find_entry.get_text():
             doc = self.get_current_doc()
             if doc:
-                bounds = doc.buffer.get_selection_bounds()
-                if bounds:
-                    _, s, e = bounds
+                if doc.buffer.get_has_selection():
+                    bounds = doc.buffer.get_selection_bounds()
+                    if len(bounds) == 3:
+                        _, s, e = bounds
+                    else:
+                        s, e = bounds
                     text = doc.buffer.get_text(s, e, False)
                     if text and "\n" not in text:
                         self.find_entry.set_text(text)
@@ -1064,14 +1083,14 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if not self.case_check.get_active():
             flags |= Gtk.TextSearchFlags.CASE_INSENSITIVE
 
-        bounds = buffer.get_selection_bounds()
-        if bounds:
-            has_sel, s, e = bounds
-        else:
-            has_sel = False
-
         result = None
-        if has_sel:
+        if buffer.get_has_selection():
+            bounds = buffer.get_selection_bounds()
+            if len(bounds) == 3:
+                _, s, e = bounds
+            else:
+                s, e = bounds
+
             if backwards:
                 result = s.backward_search(term, flags, buffer.get_start_iter())
                 if not result:
@@ -1109,14 +1128,21 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         buffer = doc.buffer
         repl = self.replace_entry.get_text()
         
-        bounds = buffer.get_selection_bounds()
-        if bounds:
-            has_sel, s, e = bounds
+        if buffer.get_has_selection():
+            bounds = buffer.get_selection_bounds()
+            if len(bounds) == 3:
+                _, s, e = bounds
+            else:
+                s, e = bounds
+            
             sel = buffer.get_text(s, e, False)
+            # 区分大小写匹配
             if self.case_check.get_active():
                 matched = (sel == term)
             else:
                 matched = (sel.lower() == term.lower())
+                
+            # 如果选中的确实是要找的词，则进行替换
             if matched:
                 offset = s.get_offset()
                 buffer.begin_user_action()
@@ -1124,6 +1150,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 new_iter = buffer.get_iter_at_offset(offset)
                 buffer.insert(new_iter, repl)
                 buffer.end_user_action()
+                # 替换后自动跳到下一个
+                self.find_next()
+                return
+        
+        # 如果当前没有选中，或者选中的不是要找的词，先跳到下一个
         self.find_next()
 
     def replace_all(self):
@@ -1136,25 +1167,16 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         repl = self.replace_entry.get_text()
         buffer = doc.buffer
 
-        # 获取当前选区，如果有选区，则只替换选区内容（防止误替换）
-        bounds = buffer.get_selection_bounds()
-        if bounds:
-            start = bounds[1]
-            end = bounds[2]
-        else:
-            start = buffer.get_start_iter()
-            end = buffer.get_end_iter()
+        start = buffer.get_start_iter()
+        end = buffer.get_end_iter()
 
-        # 获取要替换的文本段
         text = buffer.get_text(start, end, False)
         
-        # 使用正则进行替换（忽略大小写或不忽略）
         flags = re.IGNORECASE if not self.case_check.get_active() else 0
         pattern = re.compile(re.escape(term), flags)
         new_text, count = pattern.subn(repl, text)
 
         if count > 0:
-            # 记录起始偏移量，用于插入替换后的文本
             offset = start.get_offset()
             buffer.begin_user_action()
             buffer.delete(start, end)
@@ -1222,6 +1244,7 @@ class FoxNoteApp(Gtk.Application):
         bind("open",        lambda w: w.open_file()     if w else None)
         bind("save",        lambda w: w.save_file()     if w else None)
         bind("save-as",     lambda w: w.save_as()       if w else None)
+        bind("print",       lambda w: w.print_doc()     if w else None)
         bind("close-tab",   lambda w: w.close_tab()     if w else None)
         bind("rename-tab",  lambda w: w.prompt_rename() if w else None)
         bind("quit",        lambda w: self.quit())
@@ -1260,6 +1283,7 @@ class FoxNoteApp(Gtk.Application):
         self.set_accels_for_action("app.open",         ["<Ctrl>O"])
         self.set_accels_for_action("app.save",         ["<Ctrl>S"])
         self.set_accels_for_action("app.save-as",      ["<Ctrl><Shift>S"])
+        self.set_accels_for_action("app.print",        ["<Ctrl>P"])
         self.set_accels_for_action("app.rename-tab",   ["F2"])
         self.set_accels_for_action("app.close-tab",    ["<Ctrl>W"])
         self.set_accels_for_action("app.quit",         ["<Ctrl>Q"])
