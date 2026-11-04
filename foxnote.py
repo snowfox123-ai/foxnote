@@ -6,10 +6,11 @@ import locale
 import tempfile
 import re
 import subprocess
+import threading
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, Gio, Gdk, GLib
+from gi.repository import Gtk, Gio, Gdk, GLib, Pango
 
 try:
     gi.require_version("GtkSource", "5")
@@ -23,30 +24,44 @@ APP_ID = "org.foxnote.FoxNote"
 
 
 def _read_text(path):
-    """依次尝试 utf-8-sig / 系统编码 / 容错 utf-8。"""
-    try:
+    """返回 (text, encoding)。优先保留 BOM 状态和系统编码。"""
+    with open(path, "rb") as f:
+        head = f.read(3)
+    if head == b"\xef\xbb\xbf":
         with open(path, "r", encoding="utf-8-sig") as f:
-            return f.read()
+            return f.read(), "utf-8-sig"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read(), "utf-8"
     except UnicodeDecodeError:
         pass
+    enc = locale.getpreferredencoding(False)
     try:
-        enc = locale.getpreferredencoding(False)
         with open(path, "r", encoding=enc) as f:
-            return f.read()
+            return f.read(), enc
     except (UnicodeDecodeError, LookupError):
         pass
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+        return f.read(), "utf-8"
+
+
+def _selection(buffer):
+    """返回 (start_iter, end_iter)。调用前应确保 get_has_selection() 为真。"""
+    bounds = buffer.get_selection_bounds()
+    if len(bounds) == 3:
+        return bounds[1], bounds[2]
+    return bounds[0], bounds[1]
 
 
 # ---------------------------------------------------------------------------
 # 单个标签页 = 一个 Document
 # ---------------------------------------------------------------------------
 class Document:
-    def __init__(self, window, path=None, content=""):
+    def __init__(self, window, path=None, content="", encoding="utf-8"):
         self.window = window
         self.path = path
         self.display_name = None
+        self.encoding = encoding
         self.tab_label = None
 
         self.scrolled = Gtk.ScrolledWindow()
@@ -158,13 +173,8 @@ class Document:
         bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
         ok, over_iter = self.view.get_iter_at_location(bx, by)
         if ok:
-            # 修复解包崩溃问题
             if self.buffer.get_has_selection():
-                bounds = self.buffer.get_selection_bounds()
-                if len(bounds) == 3:
-                    _, s, e = bounds
-                else:
-                    s, e = bounds
+                s, e = _selection(self.buffer)
                 if (over_iter.get_offset() < s.get_offset()
                         or over_iter.get_offset() >= e.get_offset()):
                     self.buffer.place_cursor(over_iter)
@@ -207,12 +217,11 @@ class Document:
 LANG_EXT = {
     "python":     ".py",
     "html":       ".html",
-    "javascript": ".js",
     "js":         ".js",
     "css":        ".css",
     "markdown":   ".md",
     "json":       ".json",
-    "sql":        ".sql",
+    "php":        ".php",
     "sh":         ".sh"
 }
 
@@ -330,7 +339,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             lang_menu = Gio.Menu()
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
                                   ("JavaScript", "js"), ("CSS", "css"),
-                                  ("JSON", "json"), ("SQL", "sql"),
+                                  ("JSON", "json"), ("PHP", "php"),
                                   ("Shell", "sh"), 
                                   ("Markdown", "markdown"), ("纯文本", "none")):
                 item = Gio.MenuItem.new(name, None)
@@ -415,6 +424,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
     def toggle_dark(self):
         self.dark = not self.dark
+        if self.dark:
+            self.dark_btn.set_icon_name("weather-clear-symbolic")
+        else:
+            self.dark_btn.set_icon_name("weather-clear-night-symbolic")
         self._apply_theme()
 
     def _display_name(self, doc):
@@ -442,18 +455,24 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
     def _on_switch_page(self, notebook, page, page_num):
         self._update_title()
-        self.status.set_text("就绪")
+        doc = self.get_current_doc()
+        if doc and doc.buffer.get_modified():
+            self.status.set_text("已修改")
+        else:
+            self.status.set_text("就绪")
 
     def new_file(self):
         self._new_tab()
         self.status.set_text("新建文件")
 
-    def _new_tab(self, path=None, content=""):
-        doc = Document(self, path, content)
+    def _new_tab(self, path=None, content="", encoding="utf-8"):
+        doc = Document(self, path, content, encoding)
         self.docs.append(doc)
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         doc.tab_label = Gtk.Label(label=self._tab_title(doc))
+        doc.tab_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        doc.tab_label.set_max_width_chars(24)
         tab_box.append(doc.tab_label)
 
         dbl = Gtk.GestureClick()
@@ -514,7 +533,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dlg.set_child(box)
 
         label = Gtk.Label()
-        label.set_markup(f"<b>{self._tab_title(doc)} 还没保存</b>")
+        safe = GLib.markup_escape_text(self._tab_title(doc))
+        label.set_markup(f"<b>{safe} 还没保存</b>")
         label.set_xalign(0)
         box.append(label)
 
@@ -733,11 +753,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             if not path:
                 return
             try:
-                data = _read_text(path)
+                data, encoding = _read_text(path)
             except OSError as ex:
                 self._show_error("打不开", str(ex))
                 return
-            self._open_path(path, data)
+            self._open_path(path, data, encoding)
 
         dialog.open(self, None, on_done)
 
@@ -764,18 +784,18 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                     self._show_error("打不开", "目前只支持本地文件")
                     return
                 try:
-                    data = _read_text(path)
+                    data, encoding = _read_text(path)
                 except OSError as ex:
                     self._show_error("打不开", str(ex))
                     return
-                self._open_path(path, data)
+                self._open_path(path, data, encoding)
         finally:
             try:
                 dialog.destroy()
             except Exception:
                 pass
 
-    def _open_path(self, path, data):
+    def _open_path(self, path, data, encoding="utf-8"):
         doc = self.get_current_doc()
         empty = (
             doc and doc.path is None and not doc.buffer.get_modified()
@@ -787,11 +807,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             doc.buffer.set_modified(False)
             doc.path = path
             doc.display_name = None
+            doc.encoding = encoding
             doc.update_language_for_path(path)
             doc.apply_style_scheme(self.dark)
             self._update_tab_title(doc)
         else:
-            self._new_tab(path, data)
+            self._new_tab(path, data, encoding)
         self._update_title()
         self.status.set_text(f"打开 {path}")
 
@@ -808,19 +829,43 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         doc = self.get_current_doc()
         if doc:
             self._save_as_doc(doc)
+
     def print_doc(self):
         doc = self.get_current_doc()
         if not doc:
             return
         data = doc.buffer.get_text(doc.buffer.get_start_iter(),
                                    doc.buffer.get_end_iter(), False)
+        self.status.set_text("正在发送到打印队列…")
+
+        def worker():
+            try:
+                subprocess.run(
+                    ["lp"], input=data.encode("utf-8"),
+                    check=True, capture_output=True, timeout=60
+                )
+                GLib.idle_add(self._print_done, True, None)
+            except FileNotFoundError:
+                GLib.idle_add(self._print_done, False, "系统里找不到 lp 命令（需要 CUPS）。")
+            except subprocess.TimeoutExpired:
+                GLib.idle_add(self._print_done, False, "打印超时。")
+            except subprocess.CalledProcessError as ex:
+                err = ex.stderr.decode("utf-8", "replace") if ex.stderr else str(ex)
+                GLib.idle_add(self._print_done, False, f"lp 返回错误：{err}")
+            except Exception as ex:
+                GLib.idle_add(self._print_done, False, str(ex))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _print_done(self, ok, msg):
         try:
-            subprocess.run(["lp"], input=data.encode("utf-8"), check=True)
-            self.status.set_text("已发送到打印队列")
-        except FileNotFoundError:
-            self._show_error("打印失败", "系统里找不到 lp 命令（需要 CUPS）。")
-        except subprocess.CalledProcessError as ex:
-            self._show_error("打印失败", f"lp 返回错误：{ex}")
+            if ok:
+                self.status.set_text("已发送到打印队列")
+            else:
+                self._show_error("打印失败", msg)
+        except Exception:
+            pass
+        return False
 
     def _default_ext(self, doc):
         if not HAS_SOURCE:
@@ -966,11 +1011,16 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             directory = os.path.dirname(os.path.abspath(path)) or "."
             fd, tmp = tempfile.mkstemp(prefix=".foxnote-", dir=directory, text=True)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                with os.fdopen(fd, "w", encoding=doc.encoding) as f:
                     f.write(data)
                 if os.path.exists(path):
                     try:
                         os.chmod(tmp, os.stat(path).st_mode)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.chmod(tmp, 0o644)
                     except OSError:
                         pass
                 os.replace(tmp, path)
@@ -1000,6 +1050,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         unsaved = [d for d in self.docs if d.buffer.get_modified()]
         if not unsaved:
+            for d in self.docs:
+                d.cleanup()
             return False
 
         self._pending_close = unsaved[:]
@@ -1008,6 +1060,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
     def _ask_next_close(self):
         if not self._pending_close:
+            for d in self.docs:
+                d.cleanup()
             self.destroy()
             return
 
@@ -1044,11 +1098,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             doc = self.get_current_doc()
             if doc:
                 if doc.buffer.get_has_selection():
-                    bounds = doc.buffer.get_selection_bounds()
-                    if len(bounds) == 3:
-                        _, s, e = bounds
-                    else:
-                        s, e = bounds
+                    s, e = _selection(doc.buffer)
                     text = doc.buffer.get_text(s, e, False)
                     if text and "\n" not in text:
                         self.find_entry.set_text(text)
@@ -1085,11 +1135,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         result = None
         if buffer.get_has_selection():
-            bounds = buffer.get_selection_bounds()
-            if len(bounds) == 3:
-                _, s, e = bounds
-            else:
-                s, e = bounds
+            s, e = _selection(buffer)
 
             if backwards:
                 result = s.backward_search(term, flags, buffer.get_start_iter())
@@ -1129,20 +1175,13 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         repl = self.replace_entry.get_text()
         
         if buffer.get_has_selection():
-            bounds = buffer.get_selection_bounds()
-            if len(bounds) == 3:
-                _, s, e = bounds
-            else:
-                s, e = bounds
-            
+            s, e = _selection(buffer)
             sel = buffer.get_text(s, e, False)
-            # 区分大小写匹配
             if self.case_check.get_active():
                 matched = (sel == term)
             else:
                 matched = (sel.lower() == term.lower())
                 
-            # 如果选中的确实是要找的词，则进行替换
             if matched:
                 offset = s.get_offset()
                 buffer.begin_user_action()
@@ -1150,11 +1189,9 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 new_iter = buffer.get_iter_at_offset(offset)
                 buffer.insert(new_iter, repl)
                 buffer.end_user_action()
-                # 替换后自动跳到下一个
                 self.find_next()
                 return
         
-        # 如果当前没有选中，或者选中的不是要找的词，先跳到下一个
         self.find_next()
 
     def replace_all(self):
@@ -1174,7 +1211,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         
         flags = re.IGNORECASE if not self.case_check.get_active() else 0
         pattern = re.compile(re.escape(term), flags)
-        new_text, count = pattern.subn(repl, text)
+        new_text, count = pattern.subn(lambda m: repl, text)
 
         if count > 0:
             offset = start.get_offset()
@@ -1200,7 +1237,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dlg.set_child(box)
 
         label = Gtk.Label()
-        label.set_markup(f"<b>{title}</b>")
+        label.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
         label.set_xalign(0)
         box.append(label)
 
@@ -1227,7 +1264,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 # ---------------------------------------------------------------------------
 class FoxNoteApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_OPEN)
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -1298,6 +1336,22 @@ class FoxNoteApp(Gtk.Application):
         if not win:
             win = FoxNoteWindow(application=self)
         win.present()
+
+    def do_open(self, files, n_files, hint):
+        win = self.props.active_window
+        if not win:
+            win = FoxNoteWindow(application=self)
+        win.present()
+        for f in files:
+            path = f.get_path()
+            if not path:
+                continue
+            try:
+                data, encoding = _read_text(path)
+            except OSError as ex:
+                win._show_error("打不开", str(ex))
+                continue
+            win._open_path(path, data, encoding)
 
 
 def main():
