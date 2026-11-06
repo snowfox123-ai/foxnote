@@ -257,11 +257,13 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         menu_btn.set_menu_model(self._build_menu())
         header.pack_start(menu_btn)
 
+        # 修复了这里的空格对齐
         for icon, tip, action in (
             ("document-new-symbolic",  "新建 (Ctrl+N)", "app.new"),
             ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
             ("document-save-symbolic", "保存 (Ctrl+S)", "app.save"),
             ("document-print-symbolic", "打印 (Ctrl+P)", "app.print"),
+            ("window-new-symbolic", "新建窗口 (Ctrl+Shift+N)", "app.new-window"),
         ):
             btn = Gtk.Button(icon_name=icon)
             btn.set_tooltip_text(tip)
@@ -303,6 +305,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         sec = Gio.Menu()
         sec.append("新建", "app.new")
+        sec.append("新建窗口", "app.new-window")
         sec.append("打开…", "app.open")
         sec.append("保存", "app.save")
         sec.append("另存为…", "app.save-as")
@@ -465,20 +468,31 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self._new_tab()
         self.status.set_text("新建文件")
 
+    # 修复：正确缩进 new_window
+    def new_window(self):
+        win = FoxNoteWindow(self.application)
+        win.present()
+
     def _new_tab(self, path=None, content="", encoding="utf-8"):
         doc = Document(self, path, content, encoding)
         self.docs.append(doc)
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        tab_box.set_size_request(-1, 28) # 给标签栏一个基础高度
+
         doc.tab_label = Gtk.Label(label=self._tab_title(doc))
-        doc.tab_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        doc.tab_label.set_ellipsize(Pango.EllipsizeMode.END) # 改成尾部省略
         doc.tab_label.set_max_width_chars(24)
+        doc.tab_label.set_width_chars(12) # 关键：给个最小宽度，防止被挤压成 ...
+        doc.tab_label.set_xalign(0)       # 文字左对齐
+        doc.tab_label.set_single_line_mode(True)
         tab_box.append(doc.tab_label)
 
         dbl = Gtk.GestureClick()
         dbl.set_button(1)
         dbl.connect("pressed", self._on_tab_double_click, doc)
-        doc.tab_label.add_controller(dbl)
+        # 关键修改：挂载到 tab_box 上，而不是 doc.tab_label 上
+        tab_box.add_controller(dbl) 
 
         close_btn = Gtk.Button(icon_name="window-close-symbolic")
         close_btn.set_valign(Gtk.Align.CENTER)
@@ -494,9 +508,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         return doc
 
     def _on_tab_double_click(self, gesture, n_press, x, y, doc):
-        if n_press == 2:
+        # 改成 >= 2，防止第一次点击被 Notebook 吞掉导致双击失效
+        if n_press >= 2:
             self.prompt_rename(doc)
-
+            return True
+        return False
     def _update_title(self):
         doc = self.get_current_doc()
         if doc:
@@ -1279,6 +1295,7 @@ class FoxNoteApp(Gtk.Application):
             self.add_action(act)
 
         bind("new",         lambda w: w.new_file()      if w else None)
+        bind("new-window",  lambda w: w.new_window()    if w else None)
         bind("open",        lambda w: w.open_file()     if w else None)
         bind("save",        lambda w: w.save_file()     if w else None)
         bind("save-as",     lambda w: w.save_as()       if w else None)
@@ -1318,6 +1335,7 @@ class FoxNoteApp(Gtk.Application):
 
     def _setup_accels(self):
         self.set_accels_for_action("app.new",          ["<Ctrl>N"])
+        self.set_accels_for_action("app.new-window",   ["<Ctrl><Shift>N"])
         self.set_accels_for_action("app.open",         ["<Ctrl>O"])
         self.set_accels_for_action("app.save",         ["<Ctrl>S"])
         self.set_accels_for_action("app.save-as",      ["<Ctrl><Shift>S"])
