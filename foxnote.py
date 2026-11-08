@@ -259,7 +259,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         # 修复了这里的空格对齐
         for icon, tip, action in (
-            ("document-new-symbolic",  "新建 (Ctrl+N)", "app.new"),
+            ("document-new-symbolic",  "新建标签页 (Ctrl+N)", "app.new"),
             ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
             ("document-save-symbolic", "保存 (Ctrl+S)", "app.save"),
             ("document-print-symbolic", "打印 (Ctrl+P)", "app.print"),
@@ -304,7 +304,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         menu = Gio.Menu()
 
         sec = Gio.Menu()
-        sec.append("新建", "app.new")
+        sec.append("新建标签页", "app.new")
         sec.append("新建窗口", "app.new-window")
         sec.append("打开…", "app.open")
         sec.append("保存", "app.save")

@@ -45,3 +45,13 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-gtksource-5
 ```bash
 python3 foxnote.py
 ```
+### 方式三：Deb 包安装
+
+如果你使用的是 Debian/Ubuntu/Deepin 等系统，可以直接下载已编译好的 `.deb` 安装包，无需手动处理环境依赖。
+
+1. 下载仓库中的 `foxnote_1.0.0_all.deb` 文件。
+2. 在终端中进入该文件所在的目录，执行安装命令：
+
+```bash
+sudo apt install ./foxnote_1.0.0_all.deb
+```

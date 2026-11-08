@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FoxNote
+Comment=轻量 GTK4 标签式文本编辑器
+Exec=foxnote %U
+Icon=foxnote
+Terminal=false
+Categories=Utility;TextEditor;GTK;
+MimeType=text/plain;
+StartupNotify=true
