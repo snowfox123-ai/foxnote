@@ -2,7 +2,7 @@
 set -e
 
 NAME=foxnote
-VERSION=1.0.0
+VERSION=1.0.1
 ARCH=all
 PKG="build/${NAME}_${VERSION}_${ARCH}"
 

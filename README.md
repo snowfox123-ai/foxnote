@@ -49,9 +49,9 @@ python3 foxnote.py
 
 如果你使用的是 Debian/Ubuntu/Deepin 等系统，可以直接下载已编译好的 `.deb` 安装包，无需手动处理环境依赖。
 
-1. 下载仓库中的 `foxnote_1.0.0_all.deb` 文件。
+1. 下载仓库中的 `foxnote_1.0.1_all.deb` 文件。
 2. 在终端中进入该文件所在的目录，执行安装命令：
 
 ```bash
-sudo apt install ./foxnote_1.0.0_all.deb
+sudo apt install ./foxnote_1.0.1_all.deb
 ```

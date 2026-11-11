@@ -85,7 +85,6 @@ class Document:
             self.buffer.set_enable_undo(True)
             self.view = Gtk.TextView(buffer=self.buffer)
 
-        self.view.set_wrap_mode(Gtk.WrapMode.WORD)
         self.view.set_monospace(True)
         self.view.set_top_margin(6)
         self.view.set_bottom_margin(6)
@@ -121,6 +120,11 @@ class Document:
             if scheme is not None:
                 self.buffer.set_style_scheme(scheme)
                 return
+            
+    def set_wrap(self, enabled):
+        self.view.set_wrap_mode(
+            Gtk.WrapMode.WORD_CHAR if enabled else Gtk.WrapMode.NONE
+        )
 
     def _on_modified_changed(self, buffer):
         self.window._update_tab_title(self)
@@ -235,6 +239,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.application = application
         self.docs = []
         self.dark = False
+        self.wrap = True
         self._pending_close = []
 
         self.set_default_size(800, 600)
@@ -352,6 +357,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             menu.append_section(None, sec)
 
         sec = Gio.Menu()
+        sec.append("自动换行", "app.toggle-wrap")
         sec.append("深色模式", "app.toggle-dark")
         menu.append_section(None, sec)
 
@@ -432,7 +438,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         else:
             self.dark_btn.set_icon_name("weather-clear-night-symbolic")
         self._apply_theme()
-
+    def toggle_wrap(self):
+        self.wrap = not self.wrap
+        for d in self.docs:
+            d.set_wrap(self.wrap)
+        self.status.set_text("自动换行：开" if self.wrap else "自动换行：关")
     def _display_name(self, doc):
         if doc.path:
             return os.path.basename(doc.path)
@@ -475,6 +485,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
     def _new_tab(self, path=None, content="", encoding="utf-8"):
         doc = Document(self, path, content, encoding)
+        doc.set_wrap(self.wrap)
         self.docs.append(doc)
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -1300,6 +1311,7 @@ class FoxNoteApp(Gtk.Application):
         bind("save",        lambda w: w.save_file()     if w else None)
         bind("save-as",     lambda w: w.save_as()       if w else None)
         bind("print",       lambda w: w.print_doc()     if w else None)
+        bind("toggle-wrap", lambda w: w.toggle_wrap() if w else None)
         bind("close-tab",   lambda w: w.close_tab()     if w else None)
         bind("rename-tab",  lambda w: w.prompt_rename() if w else None)
         bind("quit",        lambda w: self.quit())
@@ -1346,6 +1358,7 @@ class FoxNoteApp(Gtk.Application):
         self.set_accels_for_action("app.toggle-dark",  ["<Ctrl>D"])
         self.set_accels_for_action("app.show-find",    ["<Ctrl>F"])
         self.set_accels_for_action("app.show-replace", ["<Ctrl>H"])
+        self.set_accels_for_action("app.toggle-wrap",  ["<Ctrl><Alt>W"])
         self.set_accels_for_action("app.find-next",    ["F3"])
         self.set_accels_for_action("app.find-prev",    ["<Shift>F3"])
 
