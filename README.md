@@ -53,5 +53,5 @@ python3 foxnote.py
 2. 在终端中进入该文件所在的目录，执行安装命令：
 
 ```bash
-sudo apt install ./foxnote_1.0.1_all.deb
+sudo apt install ./foxnote_1.0.2_all.deb
 ```

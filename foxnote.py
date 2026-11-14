@@ -120,7 +120,7 @@ class Document:
             if scheme is not None:
                 self.buffer.set_style_scheme(scheme)
                 return
-            
+
     def set_wrap(self, enabled):
         self.view.set_wrap_mode(
             Gtk.WrapMode.WORD_CHAR if enabled else Gtk.WrapMode.NONE
@@ -241,8 +241,9 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.dark = False
         self.wrap = True
         self._pending_close = []
+        self._last_sidebar_pos = 200
 
-        self.set_default_size(800, 600)
+        self.set_default_size(950, 650)
         self.set_title(APP_NAME)
 
         self._build_ui()
@@ -256,13 +257,14 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         header = Gtk.HeaderBar()
         self.set_titlebar(header)
 
-        menu_btn = Gtk.MenuButton()
-        menu_btn.set_icon_name("open-menu-symbolic")
-        menu_btn.set_tooltip_text("菜单")
-        menu_btn.set_menu_model(self._build_menu())
-        header.pack_start(menu_btn)
+        # 顶栏：侧栏切换按钮
+        self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-hide-symbolic")
+        self.sidebar_btn.set_tooltip_text("折叠/展开侧栏 (F9)")
+        self.sidebar_btn.set_action_name("app.toggle-sidebar")
+        self.sidebar_btn.set_active(True)
+        header.pack_start(self.sidebar_btn)
 
-        # 修复了这里的空格对齐
+        # 顶栏：常用图标
         for icon, tip, action in (
             ("document-new-symbolic",  "新建标签页 (Ctrl+N)", "app.new"),
             ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
@@ -283,17 +285,40 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_child(vbox)
 
+        # ================= 核心布局：左右分栏 =================
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.paned.set_vexpand(True)
+        self.paned.set_position(200)            # 侧栏初始宽度
+        self.paned.set_resize_start_child(False) # 缩放窗口时固定侧栏
+        self.paned.set_shrink_start_child(True)  # <---- 关键修改：允许完全收缩到 0
+        vbox.append(self.paned)
+
+        # ---------- 左侧侧栏 (由原来的下拉菜单变来) ----------
+        self.sidebar_revealer = Gtk.Revealer()
+        self.sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self.sidebar_revealer.set_transition_duration(200)
+        self.sidebar_revealer.set_reveal_child(True)
+        
+        # 构建侧栏内容
+        sidebar_content = self._build_sidebar()
+        self.sidebar_revealer.set_child(sidebar_content)
+        self.paned.set_start_child(self.sidebar_revealer)
+
+        # ---------- 右侧主区域 (标签页 + 编辑区) ----------
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.paned.set_end_child(main_box)
+
         self.notebook = Gtk.Notebook()
         self.notebook.set_scrollable(True)
         self.notebook.set_vexpand(True)
         self.notebook.connect("switch-page", self._on_switch_page)
-        vbox.append(self.notebook)
+        main_box.append(self.notebook)
 
         self.find_revealer = Gtk.Revealer()
         self.find_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
         self.find_revealer.set_reveal_child(False)
         self._build_find_bar()
-        vbox.append(self.find_revealer)
+        main_box.append(self.find_revealer)
 
         self.status = Gtk.Label(label="就绪")
         if not HAS_SOURCE:
@@ -303,65 +328,126 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.status.set_margin_end(8)
         self.status.set_margin_top(4)
         self.status.set_margin_bottom(4)
-        vbox.append(self.status)
+        main_box.append(self.status)
 
-    def _build_menu(self):
-        menu = Gio.Menu()
+    def _build_sidebar(self):
+        """构建左侧菜单面板"""
+        side_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        side_box.add_css_class("background")
+        side_box.set_margin_top(8)
+        side_box.set_margin_bottom(8)
+        side_box.set_margin_start(8)
+        side_box.set_margin_end(8)
 
-        sec = Gio.Menu()
-        sec.append("新建标签页", "app.new")
-        sec.append("新建窗口", "app.new-window")
-        sec.append("打开…", "app.open")
-        sec.append("保存", "app.save")
-        sec.append("另存为…", "app.save-as")
-        sec.append("打印…", "app.print")
-        menu.append_section(None, sec)
+        def add_btn(label, icon_name, action):
+            btn = Gtk.Button()
+            btn.add_css_class("flat")
+            btn.set_halign(Gtk.Align.FILL)
+            
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            if icon_name:
+                icon = Gtk.Image.new_from_icon_name(icon_name)
+                box.append(icon)
+            
+            lbl = Gtk.Label(label=label)
+            lbl.set_xalign(0)
+            lbl.set_hexpand(True)
+            box.append(lbl)
+            
+            btn.set_child(box)
+            if action:
+                btn.set_action_name(action)
+            return btn
 
-        sec = Gio.Menu()
-        sec.append("重命名标签页", "app.rename-tab")
-        sec.append("关闭标签页", "app.close-tab")
-        sec.append("退出", "app.quit")
-        menu.append_section(None, sec)
+        def add_sep():
+            sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            sep.set_margin_top(6)
+            sep.set_margin_bottom(6)
+            side_box.append(sep)
 
-        sec = Gio.Menu()
-        sec.append("撤销", "app.undo")
-        sec.append("重做", "app.redo")
-        menu.append_section(None, sec)
+        # 文件
+        side_box.append(add_btn("新建标签页", "document-new-symbolic", "app.new"))
+        side_box.append(add_btn("新建窗口", "window-new-symbolic", "app.new-window"))
+        side_box.append(add_btn("打开...", "document-open-symbolic", "app.open"))
+        side_box.append(add_btn("保存", "document-save-symbolic", "app.save"))
+        side_box.append(add_btn("另存为...", "document-save-as-symbolic", "app.save-as"))
+        side_box.append(add_btn("打印...", "document-print-symbolic", "app.print"))
+        add_sep()
 
-        sec = Gio.Menu()
-        sec.append("剪切", "app.cut")
-        sec.append("复制", "app.copy")
-        sec.append("粘贴", "app.paste")
-        sec.append("全选", "app.select-all")
-        menu.append_section(None, sec)
+        # 编辑
+        side_box.append(add_btn("撤销", "edit-undo-symbolic", "app.undo"))
+        side_box.append(add_btn("重做", "edit-redo-symbolic", "app.redo"))
+        side_box.append(add_btn("剪切", "edit-cut-symbolic", "app.cut"))
+        side_box.append(add_btn("复制", "edit-copy-symbolic", "app.copy"))
+        side_box.append(add_btn("粘贴", "edit-paste-symbolic", "app.paste"))
+        side_box.append(add_btn("全选", "edit-select-all-symbolic", "app.select-all"))
+        add_sep()
 
-        sec = Gio.Menu()
-        sec.append("查找…", "app.show-find")
-        sec.append("替换…", "app.show-replace")
-        sec.append("查找下一个", "app.find-next")
-        sec.append("查找上一个", "app.find-prev")
-        menu.append_section(None, sec)
+        # 标签页与搜索
+        side_box.append(add_btn("重命名标签页", "document-edit-symbolic", "app.rename-tab"))
+        side_box.append(add_btn("关闭标签页", "window-close-symbolic", "app.close-tab"))
+        add_sep()
+        
+        side_box.append(add_btn("查找...", "edit-find-symbolic", "app.show-find"))
+        side_box.append(add_btn("替换...", "edit-find-replace-symbolic", "app.show-replace"))
+        side_box.append(add_btn("查找下一个", "go-down-symbolic", "app.find-next"))
+        side_box.append(add_btn("查找上一个", "go-up-symbolic", "app.find-prev"))
+        add_sep()
+
+        # 语言选择（下拉菜单）
+        lang_btn = Gtk.MenuButton()
+        lang_btn.add_css_class("flat")
+        lang_btn.set_halign(Gtk.Align.FILL)
+        
+        lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        lang_box.append(Gtk.Image.new_from_icon_name("accessories-text-editor-symbolic"))
+        lbl = Gtk.Label(label="语言")
+        lbl.set_xalign(0)
+        lbl.set_hexpand(True)
+        lang_box.append(lbl)
+        lang_box.append(Gtk.Image.new_from_icon_name("pan-end-symbolic"))
+        lang_btn.set_child(lang_box)
 
         if HAS_SOURCE:
-            sec = Gio.Menu()
             lang_menu = Gio.Menu()
             for name, lang_id in (("Python", "python"), ("HTML", "html"),
                                   ("JavaScript", "js"), ("CSS", "css"),
                                   ("JSON", "json"), ("PHP", "php"),
-                                  ("Shell", "sh"), 
+                                  ("Shell", "sh"),
                                   ("Markdown", "markdown"), ("纯文本", "none")):
                 item = Gio.MenuItem.new(name, None)
                 item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
                 lang_menu.append_item(item)
-            sec.append_submenu("语言", lang_menu)
-            menu.append_section(None, sec)
+            lang_btn.set_menu_model(lang_menu)
+            side_box.append(lang_btn)
+        else:
+            lang_btn.set_sensitive(False)
+            side_box.append(lang_btn)
 
-        sec = Gio.Menu()
-        sec.append("自动换行", "app.toggle-wrap")
-        sec.append("深色模式", "app.toggle-dark")
-        menu.append_section(None, sec)
+        add_sep()
+        side_box.append(add_btn("自动换行", "format-justify-fill-symbolic", "app.toggle-wrap"))
+        side_box.append(add_btn("深色模式", "weather-clear-night-symbolic", "app.toggle-dark"))
+        add_sep()
+        side_box.append(add_btn("退出", "application-exit-symbolic", "app.quit"))
 
-        return menu
+        # 套上滚动条防止窗口太小时显示不全
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_child(side_box)
+        scrolled.set_vexpand(True)
+        
+        return scrolled
+
+    def toggle_sidebar(self):
+        reveal = not self.sidebar_revealer.get_reveal_child()
+        self.sidebar_revealer.set_reveal_child(reveal)
+        if reveal:
+            self.sidebar_btn.set_icon_name("sidebar-hide-symbolic")
+            self.paned.set_position(getattr(self, '_last_sidebar_pos', 200))
+        else:
+            self.sidebar_btn.set_icon_name("sidebar-show-symbolic")
+            self._last_sidebar_pos = self.paned.get_position()
+            self.paned.set_position(0)
 
     def _build_find_bar(self):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -438,11 +524,13 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         else:
             self.dark_btn.set_icon_name("weather-clear-night-symbolic")
         self._apply_theme()
+
     def toggle_wrap(self):
         self.wrap = not self.wrap
         for d in self.docs:
             d.set_wrap(self.wrap)
         self.status.set_text("自动换行：开" if self.wrap else "自动换行：关")
+
     def _display_name(self, doc):
         if doc.path:
             return os.path.basename(doc.path)
@@ -478,7 +566,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self._new_tab()
         self.status.set_text("新建文件")
 
-    # 修复：正确缩进 new_window
     def new_window(self):
         win = FoxNoteWindow(self.application)
         win.present()
@@ -489,20 +576,19 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.docs.append(doc)
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        tab_box.set_size_request(-1, 28) # 给标签栏一个基础高度
+        tab_box.set_size_request(-1, 28)
 
         doc.tab_label = Gtk.Label(label=self._tab_title(doc))
-        doc.tab_label.set_ellipsize(Pango.EllipsizeMode.END) # 改成尾部省略
+        doc.tab_label.set_ellipsize(Pango.EllipsizeMode.END)
         doc.tab_label.set_max_width_chars(24)
-        doc.tab_label.set_width_chars(12) # 关键：给个最小宽度，防止被挤压成 ...
-        doc.tab_label.set_xalign(0)       # 文字左对齐
+        doc.tab_label.set_width_chars(12)
+        doc.tab_label.set_xalign(0)
         doc.tab_label.set_single_line_mode(True)
         tab_box.append(doc.tab_label)
 
         dbl = Gtk.GestureClick()
         dbl.set_button(1)
         dbl.connect("pressed", self._on_tab_double_click, doc)
-        # 关键修改：挂载到 tab_box 上，而不是 doc.tab_label 上
         tab_box.add_controller(dbl) 
 
         close_btn = Gtk.Button(icon_name="window-close-symbolic")
@@ -519,11 +605,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         return doc
 
     def _on_tab_double_click(self, gesture, n_press, x, y, doc):
-        # 改成 >= 2，防止第一次点击被 Notebook 吞掉导致双击失效
         if n_press >= 2:
             self.prompt_rename(doc)
             return True
         return False
+
     def _update_title(self):
         doc = self.get_current_doc()
         if doc:
@@ -1200,7 +1286,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             return
         buffer = doc.buffer
         repl = self.replace_entry.get_text()
-        
+
         if buffer.get_has_selection():
             s, e = _selection(buffer)
             sel = buffer.get_text(s, e, False)
@@ -1208,7 +1294,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 matched = (sel == term)
             else:
                 matched = (sel.lower() == term.lower())
-                
+
             if matched:
                 offset = s.get_offset()
                 buffer.begin_user_action()
@@ -1218,7 +1304,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 buffer.end_user_action()
                 self.find_next()
                 return
-        
+
         self.find_next()
 
     def replace_all(self):
@@ -1235,7 +1321,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         end = buffer.get_end_iter()
 
         text = buffer.get_text(start, end, False)
-        
+
         flags = re.IGNORECASE if not self.case_check.get_active() else 0
         pattern = re.compile(re.escape(term), flags)
         new_text, count = pattern.subn(lambda m: repl, text)
@@ -1326,18 +1412,33 @@ class FoxNoteApp(Gtk.Application):
         bind("find-next",   lambda w: w.find_next()     if w else None)
         bind("find-prev",   lambda w: w.find_prev()     if w else None)
 
+        # 侧栏折叠 Action
+        sidebar_act = Gio.SimpleAction.new_stateful(
+            "toggle-sidebar", None, GLib.Variant.new_boolean(True)
+        )
+        sidebar_act.connect("activate", self._on_toggle_sidebar)
+        self.add_action(sidebar_act)
+
+        # 深色模式 Action
         dark = Gio.SimpleAction.new_stateful(
             "toggle-dark", None, GLib.Variant.new_boolean(False)
         )
         dark.connect("activate", self._on_toggle_dark)
         self.add_action(dark)
 
+        # 语言 Action
         act = Gio.SimpleAction.new("set-lang", GLib.VariantType.new("s"))
         act.connect("activate", lambda a, p: (
             self.props.active_window.set_language(p.get_string())
             if self.props.active_window else None
         ))
         self.add_action(act)
+
+    def _on_toggle_sidebar(self, action, param):
+        win = self.props.active_window
+        if win:
+            win.toggle_sidebar()
+            action.set_state(GLib.Variant.new_boolean(win.sidebar_revealer.get_reveal_child()))
 
     def _on_toggle_dark(self, action, param):
         win = self.props.active_window
@@ -1356,6 +1457,7 @@ class FoxNoteApp(Gtk.Application):
         self.set_accels_for_action("app.close-tab",    ["<Ctrl>W"])
         self.set_accels_for_action("app.quit",         ["<Ctrl>Q"])
         self.set_accels_for_action("app.toggle-dark",  ["<Ctrl>D"])
+        self.set_accels_for_action("app.toggle-sidebar", ["F9"])
         self.set_accels_for_action("app.show-find",    ["<Ctrl>F"])
         self.set_accels_for_action("app.show-replace", ["<Ctrl>H"])
         self.set_accels_for_action("app.toggle-wrap",  ["<Ctrl><Alt>W"])
