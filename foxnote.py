@@ -5,6 +5,7 @@ import sys
 import locale
 import tempfile
 import re
+import json
 import subprocess
 import threading
 import gi
@@ -21,6 +22,32 @@ except (ValueError, ImportError):
 
 APP_NAME = "FoxNote"
 APP_ID = "org.foxnote.FoxNote"
+
+# ---------------------------------------------------------------------------
+# 会话持久化
+# ---------------------------------------------------------------------------
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "foxnote")
+SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
+
+
+def _load_session():
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_session(data):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = SESSION_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SESSION_FILE)
+    except OSError:
+        pass
 
 
 def _read_text(path):
@@ -250,9 +277,90 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self._apply_theme()
         self.connect("close-request", self._on_close_request)
 
-        self.new_file()
+        if not self._restore_session():
+            self.new_file()
         self._update_title()
 
+    # ------------------------------------------------------------------
+    # 会话恢复
+    # ------------------------------------------------------------------
+    def _restore_session(self):
+        sess = _load_session()
+        if not sess:
+            return False
+
+        width = sess.get("width")
+        height = sess.get("height")
+        if isinstance(width, int) and isinstance(height, int) and width > 200 and height > 200:
+            self.set_default_size(width, height)
+
+        self.dark = bool(sess.get("dark", False))
+        self.wrap = bool(sess.get("wrap", True))
+        if self.dark:
+            self.dark_btn.set_icon_name("weather-clear-symbolic")
+        self._apply_theme()
+
+        if not sess.get("sidebar", True):
+            self.sidebar_revealer.set_reveal_child(False)
+            self.sidebar_btn.set_icon_name("sidebar-show-symbolic")
+            self.paned.set_position(0)
+        else:
+            pos = sess.get("sidebar_pos", 200)
+            if isinstance(pos, int) and pos >= 0:
+                self._last_sidebar_pos = pos
+                self.paned.set_position(pos)
+
+        opened = False
+        files = sess.get("files", [])
+        if isinstance(files, list):
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                if not path or not os.path.isfile(path):
+                    continue
+                try:
+                    data, enc = _read_text(path)
+                except OSError:
+                    continue
+                doc = self._new_tab(path, data, enc)
+                doc.set_wrap(self.wrap)
+                cursor = item.get("cursor")
+                if isinstance(cursor, int) and cursor >= 0:
+                    it = doc.buffer.get_iter_at_offset(
+                        min(cursor, doc.buffer.get_char_count())
+                    )
+                    doc.buffer.place_cursor(it)
+                    doc.view.scroll_to_iter(it, 0.0, False, 0.0, 0.0)
+                opened = True
+        return opened
+
+    def _save_session(self):
+        files = []
+        for d in self.docs:
+            if not d.path:
+                continue
+            it = d.buffer.get_iter_at_mark(d.buffer.get_insert())
+            files.append({"path": d.path, "cursor": it.get_offset()})
+
+        sidebar_visible = self.sidebar_revealer.get_reveal_child()
+        pos = self.paned.get_position()
+        if sidebar_visible and pos > 0:
+            self._last_sidebar_pos = pos
+
+        _save_session({
+            "width":  self.get_width(),
+            "height": self.get_height(),
+            "dark":   self.dark,
+            "wrap":   self.wrap,
+            "sidebar": sidebar_visible,
+            "sidebar_pos": self._last_sidebar_pos,
+            "files": files,
+        })
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
     def _build_ui(self):
         header = Gtk.HeaderBar()
         self.set_titlebar(header)
@@ -290,7 +398,9 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.paned.set_vexpand(True)
         self.paned.set_position(200)            # 侧栏初始宽度
         self.paned.set_resize_start_child(False) # 缩放窗口时固定侧栏
-        self.paned.set_shrink_start_child(True)  # <---- 关键修改：允许完全收缩到 0
+        self.paned.set_shrink_start_child(True)  # 允许完全收缩到 0
+        # 拖动分隔条时更新 _last_sidebar_pos，便于会话恢复
+        self.paned.connect("notify::position", self._on_paned_position)
         vbox.append(self.paned)
 
         # ---------- 左侧侧栏 (由原来的下拉菜单变来) ----------
@@ -298,7 +408,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
         self.sidebar_revealer.set_transition_duration(200)
         self.sidebar_revealer.set_reveal_child(True)
-        
+
         # 构建侧栏内容
         sidebar_content = self._build_sidebar()
         self.sidebar_revealer.set_child(sidebar_content)
@@ -330,6 +440,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.status.set_margin_bottom(4)
         main_box.append(self.status)
 
+    def _on_paned_position(self, paned, _pspec):
+        if self.sidebar_revealer.get_reveal_child():
+            pos = paned.get_position()
+            if pos > 0:
+                self._last_sidebar_pos = pos
+
     def _build_sidebar(self):
         """构建左侧菜单面板"""
         side_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -343,17 +459,17 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             btn = Gtk.Button()
             btn.add_css_class("flat")
             btn.set_halign(Gtk.Align.FILL)
-            
+
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             if icon_name:
                 icon = Gtk.Image.new_from_icon_name(icon_name)
                 box.append(icon)
-            
+
             lbl = Gtk.Label(label=label)
             lbl.set_xalign(0)
             lbl.set_hexpand(True)
             box.append(lbl)
-            
+
             btn.set_child(box)
             if action:
                 btn.set_action_name(action)
@@ -387,7 +503,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         side_box.append(add_btn("重命名标签页", "document-edit-symbolic", "app.rename-tab"))
         side_box.append(add_btn("关闭标签页", "window-close-symbolic", "app.close-tab"))
         add_sep()
-        
+
         side_box.append(add_btn("查找...", "edit-find-symbolic", "app.show-find"))
         side_box.append(add_btn("替换...", "edit-find-replace-symbolic", "app.show-replace"))
         side_box.append(add_btn("查找下一个", "go-down-symbolic", "app.find-next"))
@@ -398,7 +514,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         lang_btn = Gtk.MenuButton()
         lang_btn.add_css_class("flat")
         lang_btn.set_halign(Gtk.Align.FILL)
-        
+
         lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         lang_box.append(Gtk.Image.new_from_icon_name("accessories-text-editor-symbolic"))
         lbl = Gtk.Label(label="语言")
@@ -435,7 +551,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_child(side_box)
         scrolled.set_vexpand(True)
-        
+
         return scrolled
 
     def toggle_sidebar(self):
@@ -589,7 +705,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dbl = Gtk.GestureClick()
         dbl.set_button(1)
         dbl.connect("pressed", self._on_tab_double_click, doc)
-        tab_box.add_controller(dbl) 
+        tab_box.add_controller(dbl)
 
         close_btn = Gtk.Button(icon_name="window-close-symbolic")
         close_btn.set_valign(Gtk.Align.CENTER)
@@ -1163,6 +1279,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         unsaved = [d for d in self.docs if d.buffer.get_modified()]
         if not unsaved:
+            self._save_session()
             for d in self.docs:
                 d.cleanup()
             return False
@@ -1173,6 +1290,7 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
     def _ask_next_close(self):
         if not self._pending_close:
+            self._save_session()
             for d in self.docs:
                 d.cleanup()
             self.destroy()
