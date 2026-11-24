@@ -8,8 +8,8 @@ import re
 import json
 import subprocess
 import threading
-import gi
 
+import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, Gdk, GLib, Pango
 
@@ -23,11 +23,23 @@ except (ValueError, ImportError):
 APP_NAME = "FoxNote"
 APP_ID = "org.foxnote.FoxNote"
 
+# FIX: GtkSourceView 5.0~5.3 之间 undo API 有变动，做个能力探测
+if HAS_SOURCE:
+    _probe = GtkSource.Buffer()
+    HAS_UNDO_API = hasattr(_probe, "set_enable_undo") and hasattr(_probe, "get_can_undo")
+    del _probe
+else:
+    HAS_UNDO_API = False
+
+
 # ---------------------------------------------------------------------------
 # 会话持久化
 # ---------------------------------------------------------------------------
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "foxnote")
 SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
+
+# FIX: 会话中内联保存未保存文档的单个内容上限（字节）
+MAX_INLINE_DRAFT = 512 * 1024
 
 
 def _load_session():
@@ -89,6 +101,7 @@ class Document:
         self.path = path
         self.display_name = None
         self.encoding = encoding
+
         self.tab_label = None
 
         self.scrolled = Gtk.ScrolledWindow()
@@ -97,10 +110,14 @@ class Document:
 
         if HAS_SOURCE:
             self.buffer = GtkSource.Buffer()
-            self.buffer.set_enable_undo(True)
+            # FIX: set_enable_undo 在 GtkSourceView 5.0~5.3 不存在
+            if HAS_UNDO_API:
+                try:
+                    self.buffer.set_enable_undo(True)
+                except Exception:
+                    pass
             self.buffer.set_highlight_syntax(True)
             self.buffer.set_highlight_matching_brackets(True)
-
             self.view = GtkSource.View(buffer=self.buffer)
             self.view.set_show_line_numbers(True)
             self.view.set_highlight_current_line(True)
@@ -111,19 +128,17 @@ class Document:
             self.buffer = Gtk.TextBuffer()
             self.buffer.set_enable_undo(True)
             self.view = Gtk.TextView(buffer=self.buffer)
-
-        self.view.set_monospace(True)
-        self.view.set_top_margin(6)
-        self.view.set_bottom_margin(6)
-        self.view.set_left_margin(8)
-        self.view.set_right_margin(8)
+            self.view.set_monospace(True)
+            self.view.set_top_margin(6)
+            self.view.set_bottom_margin(6)
+            self.view.set_left_margin(8)
+            self.view.set_right_margin(8)
 
         self.scrolled.set_child(self.view)
 
         if content:
             self.buffer.set_text(content)
         self.buffer.set_modified(False)
-
         self.buffer.connect("modified-changed", self._on_modified_changed)
 
         self._setup_context_menu()
@@ -134,14 +149,19 @@ class Document:
         if not HAS_SOURCE:
             return
         lm = GtkSource.LanguageManager.get_default()
-        lang = lm.guess_language(path) if path else None
+        # FIX: guess_language 需要 (filename, content_type) 两个参数
+        try:
+            lang = lm.guess_language(path, None) if path else None
+        except TypeError:
+            lang = lm.guess_language(path) if path else None
         self.buffer.set_language(lang)
 
     def apply_style_scheme(self, dark):
         if not HAS_SOURCE:
             return
         mgr = GtkSource.StyleSchemeManager.get_default()
-        candidates = ("Adwaita-dark", "oblivion", "solarized-dark") if dark else ("Adwaita", "classic", "solarized-light")
+        candidates = ("Adwaita-dark", "oblivion", "solarized-dark") if dark \
+            else ("Adwaita", "classic", "solarized-light")
         for sid in candidates:
             scheme = mgr.get_scheme(sid)
             if scheme is not None:
@@ -157,7 +177,7 @@ class Document:
         self.window._update_tab_title(self)
         if self.window.get_current_doc() is self:
             self.window._update_title()
-            self.window.status.set_text("已修改" if buffer.get_modified() else "就绪")
+        self.window.status.set_text("已修改" if buffer.get_modified() else "就绪")
 
     def cleanup(self):
         try:
@@ -200,8 +220,8 @@ class Document:
 
     def _on_right_click(self, gesture, n_press, x, y):
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-
-        bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        bx, by = self.view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET,
+                                                   int(x), int(y))
         ok, over_iter = self.view.get_iter_at_location(bx, by)
         if ok:
             if self.buffer.get_has_selection():
@@ -222,23 +242,28 @@ class Document:
         self.popover.popup()
 
     def _undo(self):
+        if not HAS_UNDO_API:
+            return
         try:
             if self.buffer.get_can_undo():
                 self.buffer.undo()
-                self.view.grab_focus()
+            self.view.grab_focus()
         except Exception:
             pass
 
     def _redo(self):
+        if not HAS_UNDO_API:
+            return
         try:
             if self.buffer.get_can_redo():
                 self.buffer.redo()
-                self.view.grab_focus()
+            self.view.grab_focus()
         except Exception:
             pass
 
     def _select_all(self):
-        self.buffer.select_range(self.buffer.get_start_iter(), self.buffer.get_end_iter())
+        self.buffer.select_range(self.buffer.get_start_iter(),
+                                 self.buffer.get_end_iter())
         self.view.grab_focus()
 
 
@@ -246,14 +271,14 @@ class Document:
 # 语言 ID → 保存时默认扩展名
 # ---------------------------------------------------------------------------
 LANG_EXT = {
-    "python":     ".py",
-    "html":       ".html",
-    "js":         ".js",
-    "css":        ".css",
-    "markdown":   ".md",
-    "json":       ".json",
-    "php":        ".php",
-    "sh":         ".sh"
+    "python": ".py",
+    "html": ".html",
+    "js": ".js",
+    "css": ".css",
+    "markdown": ".md",
+    "json": ".json",
+    "php": ".php",
+    "sh": ".sh"
 }
 
 
@@ -291,14 +316,15 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         width = sess.get("width")
         height = sess.get("height")
-        if isinstance(width, int) and isinstance(height, int) and width > 200 and height > 200:
+        if isinstance(width, int) and isinstance(height, int) \
+                and width > 200 and height > 200:
             self.set_default_size(width, height)
 
         self.dark = bool(sess.get("dark", False))
         self.wrap = bool(sess.get("wrap", True))
         if self.dark:
             self.dark_btn.set_icon_name("weather-clear-symbolic")
-        self._apply_theme()
+            self._apply_theme()
 
         if not sess.get("sidebar", True):
             self.sidebar_revealer.set_reveal_child(False)
@@ -311,6 +337,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 self.paned.set_position(pos)
 
         opened = False
+
+        # FIX: 恢复磁盘文件
         files = sess.get("files", [])
         if isinstance(files, list):
             for item in files:
@@ -333,15 +361,65 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                     doc.buffer.place_cursor(it)
                     doc.view.scroll_to_iter(it, 0.0, False, 0.0, 0.0)
                 opened = True
+
+        # FIX: 恢复未保存的草稿（内存中的内容）
+        drafts = sess.get("drafts", [])
+        if isinstance(drafts, list):
+            for item in drafts:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or "未命名"
+                content = item.get("content")
+                if not isinstance(content, str):
+                    continue
+                doc = self._new_tab(None, content, "utf-8")
+                doc.display_name = name
+                doc.set_wrap(self.wrap)
+                doc.update_language_for_path(None)
+                cursor = item.get("cursor")
+                if isinstance(cursor, int) and cursor >= 0:
+                    it = doc.buffer.get_iter_at_offset(
+                        min(cursor, doc.buffer.get_char_count())
+                    )
+                    doc.buffer.place_cursor(it)
+                # 草稿视为已修改（用户还需要保存它）
+                doc.buffer.set_modified(True)
+                opened = True
+
         return opened
 
     def _save_session(self):
+        # FIX: 多窗口时只让最后一个存活的窗口保存会话，
+        # 避免先关闭的窗口覆盖后关闭窗口的会话
+        app = self.get_application()
+        if app is not None:
+            others = [w for w in app.get_windows() if w is not self]
+            if others:
+                return  # 还有别的窗口，让最后关闭的那个来保存
+
         files = []
+        drafts = []
         for d in self.docs:
-            if not d.path:
-                continue
             it = d.buffer.get_iter_at_mark(d.buffer.get_insert())
-            files.append({"path": d.path, "cursor": it.get_offset()})
+            cursor = it.get_offset()
+            if d.path:
+                files.append({"path": d.path, "cursor": cursor})
+            else:
+                # FIX: 未保存文档的内联草稿
+                text = d.buffer.get_text(
+                    d.buffer.get_start_iter(),
+                    d.buffer.get_end_iter(),
+                    False,
+                )
+                if not text.strip():
+                    continue  # 空白未命名标签页不值得保存
+                if len(text.encode("utf-8", "replace")) > MAX_INLINE_DRAFT:
+                    continue  # 太大，跳过（避免 session.json 爆炸）
+                drafts.append({
+                    "name": d.display_name or "未命名",
+                    "content": text,
+                    "cursor": cursor,
+                })
 
         sidebar_visible = self.sidebar_revealer.get_reveal_child()
         pos = self.paned.get_position()
@@ -349,13 +427,14 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             self._last_sidebar_pos = pos
 
         _save_session({
-            "width":  self.get_width(),
+            "width": self.get_width(),
             "height": self.get_height(),
-            "dark":   self.dark,
-            "wrap":   self.wrap,
+            "dark": self.dark,
+            "wrap": self.wrap,
             "sidebar": sidebar_visible,
             "sidebar_pos": self._last_sidebar_pos,
             "files": files,
+            "drafts": drafts,
         })
 
     # ------------------------------------------------------------------
@@ -365,16 +444,14 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         header = Gtk.HeaderBar()
         self.set_titlebar(header)
 
-        # 顶栏：侧栏切换按钮
         self.sidebar_btn = Gtk.ToggleButton(icon_name="sidebar-hide-symbolic")
         self.sidebar_btn.set_tooltip_text("折叠/展开侧栏 (F9)")
         self.sidebar_btn.set_action_name("app.toggle-sidebar")
         self.sidebar_btn.set_active(True)
         header.pack_start(self.sidebar_btn)
 
-        # 顶栏：常用图标
         for icon, tip, action in (
-            ("document-new-symbolic",  "新建标签页 (Ctrl+N)", "app.new"),
+            ("document-new-symbolic", "新建标签页 (Ctrl+N)", "app.new"),
             ("document-open-symbolic", "打开 (Ctrl+O)", "app.open"),
             ("document-save-symbolic", "保存 (Ctrl+S)", "app.save"),
             ("document-print-symbolic", "打印 (Ctrl+P)", "app.print"),
@@ -393,28 +470,22 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_child(vbox)
 
-        # ================= 核心布局：左右分栏 =================
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.paned.set_vexpand(True)
-        self.paned.set_position(200)            # 侧栏初始宽度
-        self.paned.set_resize_start_child(False) # 缩放窗口时固定侧栏
-        self.paned.set_shrink_start_child(True)  # 允许完全收缩到 0
-        # 拖动分隔条时更新 _last_sidebar_pos，便于会话恢复
+        self.paned.set_position(200)
+        self.paned.set_resize_start_child(False)
+        self.paned.set_shrink_start_child(True)
         self.paned.connect("notify::position", self._on_paned_position)
         vbox.append(self.paned)
 
-        # ---------- 左侧侧栏 (由原来的下拉菜单变来) ----------
         self.sidebar_revealer = Gtk.Revealer()
         self.sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
         self.sidebar_revealer.set_transition_duration(200)
         self.sidebar_revealer.set_reveal_child(True)
-
-        # 构建侧栏内容
         sidebar_content = self._build_sidebar()
         self.sidebar_revealer.set_child(sidebar_content)
         self.paned.set_start_child(self.sidebar_revealer)
 
-        # ---------- 右侧主区域 (标签页 + 编辑区) ----------
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.paned.set_end_child(main_box)
 
@@ -447,7 +518,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 self._last_sidebar_pos = pos
 
     def _build_sidebar(self):
-        """构建左侧菜单面板"""
         side_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         side_box.add_css_class("background")
         side_box.set_margin_top(8)
@@ -459,17 +529,14 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             btn = Gtk.Button()
             btn.add_css_class("flat")
             btn.set_halign(Gtk.Align.FILL)
-
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             if icon_name:
                 icon = Gtk.Image.new_from_icon_name(icon_name)
                 box.append(icon)
-
             lbl = Gtk.Label(label=label)
             lbl.set_xalign(0)
             lbl.set_hexpand(True)
             box.append(lbl)
-
             btn.set_child(box)
             if action:
                 btn.set_action_name(action)
@@ -481,7 +548,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             sep.set_margin_bottom(6)
             side_box.append(sep)
 
-        # 文件
         side_box.append(add_btn("新建标签页", "document-new-symbolic", "app.new"))
         side_box.append(add_btn("新建窗口", "window-new-symbolic", "app.new-window"))
         side_box.append(add_btn("打开...", "document-open-symbolic", "app.open"))
@@ -490,7 +556,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         side_box.append(add_btn("打印...", "document-print-symbolic", "app.print"))
         add_sep()
 
-        # 编辑
         side_box.append(add_btn("撤销", "edit-undo-symbolic", "app.undo"))
         side_box.append(add_btn("重做", "edit-redo-symbolic", "app.redo"))
         side_box.append(add_btn("剪切", "edit-cut-symbolic", "app.cut"))
@@ -499,22 +564,17 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         side_box.append(add_btn("全选", "edit-select-all-symbolic", "app.select-all"))
         add_sep()
 
-        # 标签页与搜索
         side_box.append(add_btn("重命名标签页", "document-edit-symbolic", "app.rename-tab"))
         side_box.append(add_btn("关闭标签页", "window-close-symbolic", "app.close-tab"))
         add_sep()
 
         side_box.append(add_btn("查找...", "edit-find-symbolic", "app.show-find"))
         side_box.append(add_btn("替换...", "edit-find-replace-symbolic", "app.show-replace"))
-        side_box.append(add_btn("查找下一个", "go-down-symbolic", "app.find-next"))
-        side_box.append(add_btn("查找上一个", "go-up-symbolic", "app.find-prev"))
         add_sep()
 
-        # 语言选择（下拉菜单）
         lang_btn = Gtk.MenuButton()
         lang_btn.add_css_class("flat")
         lang_btn.set_halign(Gtk.Align.FILL)
-
         lang_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         lang_box.append(Gtk.Image.new_from_icon_name("accessories-text-editor-symbolic"))
         lbl = Gtk.Label(label="语言")
@@ -526,19 +586,21 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         if HAS_SOURCE:
             lang_menu = Gio.Menu()
-            for name, lang_id in (("Python", "python"), ("HTML", "html"),
-                                  ("JavaScript", "js"), ("CSS", "css"),
-                                  ("JSON", "json"), ("PHP", "php"),
-                                  ("Shell", "sh"),
-                                  ("Markdown", "markdown"), ("纯文本", "none")):
+            for name, lang_id in (
+                ("纯文本", "none"),
+                ("Python", "python"), ("HTML", "html"), ("JavaScript", "js"),
+                ("CSS", "css"), ("JSON", "json"), ("PHP", "php"),
+                ("Shell", "sh"), ("Markdown", "markdown"),
+            ):
                 item = Gio.MenuItem.new(name, None)
-                item.set_action_and_target_value("app.set-lang", GLib.Variant.new_string(lang_id))
+                item.set_action_and_target_value(
+                    "app.set-lang", GLib.Variant.new_string(lang_id)
+                )
                 lang_menu.append_item(item)
             lang_btn.set_menu_model(lang_menu)
-            side_box.append(lang_btn)
         else:
             lang_btn.set_sensitive(False)
-            side_box.append(lang_btn)
+        side_box.append(lang_btn)
 
         add_sep()
         side_box.append(add_btn("自动换行", "format-justify-fill-symbolic", "app.toggle-wrap"))
@@ -546,12 +608,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         add_sep()
         side_box.append(add_btn("退出", "application-exit-symbolic", "app.quit"))
 
-        # 套上滚动条防止窗口太小时显示不全
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_child(side_box)
         scrolled.set_vexpand(True)
-
         return scrolled
 
     def toggle_sidebar(self):
@@ -576,16 +636,15 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         outer.append(row1)
         row1.append(Gtk.Label(label="查找"))
-
         self.find_entry = Gtk.Entry()
         self.find_entry.set_hexpand(True)
         self.find_entry.connect("activate", lambda e: self.find_next())
         row1.append(self.find_entry)
-
         self.case_check = Gtk.CheckButton(label="区分大小写")
         row1.append(self.case_check)
-
-        for label, cb in (("上一个", self.find_prev), ("下一个", self.find_next), ("×", self.hide_find)):
+        for label, cb in (("上一个", self.find_prev),
+                          ("下一个", self.find_next),
+                          ("×", self.hide_find)):
             b = Gtk.Button(label=label)
             b.connect("clicked", lambda _b, cb=cb: cb())
             row1.append(b)
@@ -593,14 +652,13 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         self.row_replace = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         outer.append(self.row_replace)
         self.row_replace.set_visible(False)
-
         self.row_replace.append(Gtk.Label(label="替换"))
         self.replace_entry = Gtk.Entry()
         self.replace_entry.set_hexpand(True)
         self.replace_entry.connect("activate", lambda e: self.replace_one())
         self.row_replace.append(self.replace_entry)
-
-        for label, cb in (("替换", self.replace_one), ("全部替换", self.replace_all)):
+        for label, cb in (("替换", self.replace_one),
+                          ("全部替换", self.replace_all)):
             b = Gtk.Button(label=label)
             b.connect("clicked", lambda _b, cb=cb: cb())
             self.row_replace.append(b)
@@ -626,8 +684,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if settings:
             settings.props.gtk_application_prefer_dark_theme = self.dark
             try:
-                settings.set_property("gtk-interface-color-scheme",
-                                      "prefer-dark" if self.dark else "default")
+                settings.set_property(
+                    "gtk-interface-color-scheme",
+                    "prefer-dark" if self.dark else "default",
+                )
             except Exception:
                 pass
         for doc in self.docs:
@@ -693,7 +753,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         tab_box.set_size_request(-1, 28)
-
         doc.tab_label = Gtk.Label(label=self._tab_title(doc))
         doc.tab_label.set_ellipsize(Pango.EllipsizeMode.END)
         doc.tab_label.set_max_width_chars(24)
@@ -753,7 +812,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dlg = Gtk.Window(transient_for=self, modal=True)
         dlg.set_title("未保存的更改")
         dlg.set_default_size(350, -1)
-
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(20)
         box.set_margin_bottom(20)
@@ -766,7 +824,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         label.set_markup(f"<b>{safe} 还没保存</b>")
         label.set_xalign(0)
         box.append(label)
-
         label2 = Gtk.Label(label="要保存改动吗？")
         label2.set_xalign(0)
         box.append(label2)
@@ -852,7 +909,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
     def select_all(self):
         doc = self.get_current_doc()
         if doc:
-            doc.buffer.select_range(doc.buffer.get_start_iter(), doc.buffer.get_end_iter())
+            doc.buffer.select_range(doc.buffer.get_start_iter(),
+                                    doc.buffer.get_end_iter())
             doc.view.grab_focus()
 
     def set_language(self, lang_id):
@@ -866,35 +924,39 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         if lang_id == "none":
             doc.buffer.set_language(None)
             self.status.set_text("已切换为纯文本")
-            return
-
-        lang = lm.get_language(lang_id)
-        if lang is None:
-            target = lang_id.lower()
-            for lid in lm.get_language_ids():
-                cand = lm.get_language(lid)
-                if cand is None:
-                    continue
-                if cand.get_name().lower() == target or lid.lower() == target:
-                    lang = cand
-                    break
-
-        if lang:
-            doc.buffer.set_language(lang)
-            self.status.set_text(f"语法：{lang.get_name()}")
         else:
-            self.status.set_text(f"未找到语言：{lang_id}")
+            lang = lm.get_language(lang_id)
+            if lang is None:
+                target = lang_id.lower()
+                for lid in lm.get_language_ids():
+                    cand = lm.get_language(lid)
+                    if cand is None:
+                        continue
+                    if cand.get_name().lower() == target or lid.lower() == target:
+                        lang = cand
+                        break
+            if lang:
+                doc.buffer.set_language(lang)
+                self.status.set_text(f"语法：{lang.get_name()}")
+            else:
+                lang_id = "none"
+                self.status.set_text(f"未找到语言：{lang_id}")
+
+        # FIX: 同步 stateful action 的状态，菜单出现单选圆点
+        app = self.get_application()
+        if app is not None:
+            act = app.lookup_action("set-lang")
+            if act is not None and hasattr(act, "set_state"):
+                act.set_state(GLib.Variant.new_string(lang_id))
 
     def prompt_rename(self, doc=None):
         if doc is None:
             doc = self.get_current_doc()
         if doc is None:
             return
-
         dlg = Gtk.Window(transient_for=self, modal=True)
         dlg.set_title("重命名")
         dlg.set_default_size(320, -1)
-
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(14)
         box.set_margin_bottom(14)
@@ -926,12 +988,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         cancel_btn = Gtk.Button(label="取消")
         cancel_btn.connect("clicked", lambda _b: finish(False))
         row.append(cancel_btn)
-
         ok_btn = Gtk.Button(label="确定")
         ok_btn.add_css_class("suggested-action")
         ok_btn.connect("clicked", lambda _b: finish(True))
         row.append(ok_btn)
-
         entry.connect("activate", lambda _e: finish(True))
         dlg.set_default_widget(ok_btn)
         dlg.present()
@@ -956,7 +1016,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             doc.apply_style_scheme(self.dark)
         else:
             doc.display_name = new_name
-
         self._update_tab_title(doc)
         self._update_title()
         self.status.set_text(f"已重命名为 {self._display_name(doc)}")
@@ -991,12 +1050,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dialog.open(self, None, on_done)
 
     def _open_with_choosernative(self):
-        dialog = Gtk.FileChooserNative.new("打开文件", self,
-                                           Gtk.FileChooserAction.OPEN, "打开", "取消")
+        dialog = Gtk.FileChooserNative.new(
+            "打开文件", self, Gtk.FileChooserAction.OPEN, "打开", "取消")
         filt = Gtk.FileFilter()
         filt.set_name("文本 / 代码")
-        for p in ("*.txt", "*.md", "*.py", "*.html", "*.htm", "*.js",
-                  "*.css", "*.json", "*"):
+        for p in ("*.txt", "*.md", "*.py", "*.html", "*.htm",
+                  "*.js", "*.css", "*.json", "*"):
             filt.add_pattern(p)
         dialog.add_filter(filt)
         dialog.connect("response", self._on_open_response)
@@ -1027,9 +1086,11 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
     def _open_path(self, path, data, encoding="utf-8"):
         doc = self.get_current_doc()
         empty = (
-            doc and doc.path is None and not doc.buffer.get_modified()
-            and not doc.buffer.get_text(doc.buffer.get_start_iter(),
-                                        doc.buffer.get_end_iter(), False).strip()
+            doc and doc.path is None
+            and not doc.buffer.get_modified()
+            and not doc.buffer.get_text(
+                doc.buffer.get_start_iter(),
+                doc.buffer.get_end_iter(), False).strip()
         )
         if empty:
             doc.buffer.set_text(data)
@@ -1063,19 +1124,23 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         doc = self.get_current_doc()
         if not doc:
             return
-        data = doc.buffer.get_text(doc.buffer.get_start_iter(),
-                                   doc.buffer.get_end_iter(), False)
+        data = doc.buffer.get_text(
+            doc.buffer.get_start_iter(), doc.buffer.get_end_iter(), False)
         self.status.set_text("正在发送到打印队列…")
 
         def worker():
             try:
                 subprocess.run(
-                    ["lp"], input=data.encode("utf-8"),
-                    check=True, capture_output=True, timeout=60
+                    ["lp"],
+                    input=data.encode("utf-8"),
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
                 )
                 GLib.idle_add(self._print_done, True, None)
             except FileNotFoundError:
-                GLib.idle_add(self._print_done, False, "系统里找不到 lp 命令（需要 CUPS）。")
+                GLib.idle_add(self._print_done, False,
+                              "系统里找不到 lp 命令（需要 CUPS）。")
             except subprocess.TimeoutExpired:
                 GLib.idle_add(self._print_done, False, "打印超时。")
             except subprocess.CalledProcessError as ex:
@@ -1105,7 +1170,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             return ".txt"
         if lang is None:
             return ".txt"
-
         ext = LANG_EXT.get(lang.get_id())
         if ext:
             return ext
@@ -1122,37 +1186,31 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
     def _make_save_filters(self, doc):
         store = Gio.ListStore.new(Gtk.FileFilter)
         ext = self._default_ext(doc)
-
+        default = None
         if ext != ".txt":
             f1 = Gtk.FileFilter()
             f1.set_name(f"当前语言 (*{ext})")
             f1.add_pattern("*" + ext)
             store.append(f1)
-        else:
-            f1 = None
-
+            default = f1
         f2 = Gtk.FileFilter()
         f2.set_name("纯文本 (*.txt)")
         f2.add_pattern("*.txt")
         store.append(f2)
-
         f3 = Gtk.FileFilter()
         f3.set_name("所有文件")
         f3.add_pattern("*")
         store.append(f3)
-
-        default = f1 or f2
-        return store, default
+        return store, default or f2
 
     def _save_as_doc(self, doc, on_success=None, on_cancel=None):
         if doc is None:
             return
-
         if doc.path:
             base = os.path.splitext(os.path.basename(doc.path))[0]
         else:
             base = doc.display_name or "未命名"
-            base = os.path.splitext(base)[0]
+        base = os.path.splitext(base)[0]
         ext = self._default_ext(doc)
         default_name = base + ext
 
@@ -1165,7 +1223,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dialog = Gtk.FileDialog()
         dialog.set_title("另存为")
         dialog.set_initial_name(default_name)
-
         try:
             store, default_filter = self._make_save_filters(doc)
             dialog.set_filters(store)
@@ -1181,7 +1238,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                     path = file.get_path()
             except Exception:
                 pass
-
             if path:
                 if self._save_to(doc, path):
                     if on_success:
@@ -1195,11 +1251,10 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dialog.save(self, None, on_done)
 
     def _save_as_choosernative(self, doc, default_name, on_success, on_cancel):
-        dialog = Gtk.FileChooserNative.new("另存为", self,
-                                           Gtk.FileChooserAction.SAVE, "保存", "取消")
+        dialog = Gtk.FileChooserNative.new(
+            "另存为", self, Gtk.FileChooserAction.SAVE, "保存", "取消")
         dialog.set_do_overwrite_confirmation(True)
         dialog.set_current_name(default_name)
-
         try:
             store, default_filter = self._make_save_filters(doc)
             for i in range(store.get_n_items()):
@@ -1234,8 +1289,8 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dialog.show()
 
     def _save_to(self, doc, path):
-        data = doc.buffer.get_text(doc.buffer.get_start_iter(),
-                                   doc.buffer.get_end_iter(), False)
+        data = doc.buffer.get_text(
+            doc.buffer.get_start_iter(), doc.buffer.get_end_iter(), False)
         try:
             directory = os.path.dirname(os.path.abspath(path)) or "."
             fd, tmp = tempfile.mkstemp(prefix=".foxnote-", dir=directory, text=True)
@@ -1276,14 +1331,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
     def _on_close_request(self, window):
         if self._pending_close:
             return True
-
         unsaved = [d for d in self.docs if d.buffer.get_modified()]
         if not unsaved:
             self._save_session()
             for d in self.docs:
                 d.cleanup()
             return False
-
         self._pending_close = unsaved[:]
         self._ask_next_close()
         return True
@@ -1295,7 +1348,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 d.cleanup()
             self.destroy()
             return
-
         doc = self._pending_close[0]
 
         def done():
@@ -1358,7 +1410,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         term = self.find_entry.get_text()
         if not term:
             return
-
         buffer = doc.buffer
         flags = Gtk.TextSearchFlags(0)
         if not self.case_check.get_active():
@@ -1367,25 +1418,28 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         result = None
         if buffer.get_has_selection():
             s, e = _selection(buffer)
-
             if backwards:
                 result = s.backward_search(term, flags, buffer.get_start_iter())
                 if not result:
-                    result = buffer.get_end_iter().backward_search(term, flags, buffer.get_start_iter())
+                    result = buffer.get_end_iter().backward_search(
+                        term, flags, buffer.get_start_iter())
             else:
                 result = e.forward_search(term, flags, buffer.get_end_iter())
                 if not result:
-                    result = buffer.get_start_iter().forward_search(term, flags, buffer.get_end_iter())
+                    result = buffer.get_start_iter().forward_search(
+                        term, flags, buffer.get_end_iter())
         else:
             cursor = buffer.get_iter_at_mark(buffer.get_insert())
             if backwards:
                 result = cursor.backward_search(term, flags, buffer.get_start_iter())
                 if not result:
-                    result = buffer.get_end_iter().backward_search(term, flags, buffer.get_start_iter())
+                    result = buffer.get_end_iter().backward_search(
+                        term, flags, buffer.get_start_iter())
             else:
                 result = cursor.forward_search(term, flags, buffer.get_end_iter())
                 if not result:
-                    result = buffer.get_start_iter().forward_search(term, flags, buffer.get_end_iter())
+                    result = buffer.get_start_iter().forward_search(
+                        term, flags, buffer.get_end_iter())
 
         if not result:
             self.status.set_text(f"没找到 {term}")
@@ -1412,7 +1466,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 matched = (sel == term)
             else:
                 matched = (sel.lower() == term.lower())
-
             if matched:
                 offset = s.get_offset()
                 buffer.begin_user_action()
@@ -1422,7 +1475,6 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
                 buffer.end_user_action()
                 self.find_next()
                 return
-
         self.find_next()
 
     def replace_all(self):
@@ -1434,16 +1486,12 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
             return
         repl = self.replace_entry.get_text()
         buffer = doc.buffer
-
         start = buffer.get_start_iter()
         end = buffer.get_end_iter()
-
         text = buffer.get_text(start, end, False)
-
         flags = re.IGNORECASE if not self.case_check.get_active() else 0
         pattern = re.compile(re.escape(term), flags)
         new_text, count = pattern.subn(lambda m: repl, text)
-
         if count > 0:
             offset = start.get_offset()
             buffer.begin_user_action()
@@ -1459,33 +1507,27 @@ class FoxNoteWindow(Gtk.ApplicationWindow):
         dlg = Gtk.Window(transient_for=self, modal=True)
         dlg.set_title(title)
         dlg.set_default_size(350, -1)
-
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(20)
         box.set_margin_bottom(20)
         box.set_margin_start(20)
         box.set_margin_end(20)
         dlg.set_child(box)
-
         label = Gtk.Label()
         label.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
         label.set_xalign(0)
         box.append(label)
-
         label2 = Gtk.Label(label=msg)
         label2.set_xalign(0)
         label2.set_wrap(True)
         box.append(label2)
-
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         btn_box.set_halign(Gtk.Align.END)
         box.append(btn_box)
-
         close_btn = Gtk.Button(label="关闭")
         close_btn.add_css_class("suggested-action")
         close_btn.connect("clicked", lambda _b: dlg.destroy())
         btn_box.append(close_btn)
-
         dlg.connect("close-request", lambda w: (w.destroy(), True))
         dlg.present()
 
@@ -1509,54 +1551,54 @@ class FoxNoteApp(Gtk.Application):
             act.connect("activate", lambda a, p: fn(self.props.active_window))
             self.add_action(act)
 
-        bind("new",         lambda w: w.new_file()      if w else None)
-        bind("new-window",  lambda w: w.new_window()    if w else None)
-        bind("open",        lambda w: w.open_file()     if w else None)
-        bind("save",        lambda w: w.save_file()     if w else None)
-        bind("save-as",     lambda w: w.save_as()       if w else None)
-        bind("print",       lambda w: w.print_doc()     if w else None)
+        bind("new", lambda w: w.new_file() if w else None)
+        bind("new-window", lambda w: w.new_window() if w else None)
+        bind("open", lambda w: w.open_file() if w else None)
+        bind("save", lambda w: w.save_file() if w else None)
+        bind("save-as", lambda w: w.save_as() if w else None)
+        bind("print", lambda w: w.print_doc() if w else None)
         bind("toggle-wrap", lambda w: w.toggle_wrap() if w else None)
-        bind("close-tab",   lambda w: w.close_tab()     if w else None)
-        bind("rename-tab",  lambda w: w.prompt_rename() if w else None)
-        bind("quit",        lambda w: self.quit())
-        bind("undo",        lambda w: w.undo()          if w else None)
-        bind("redo",        lambda w: w.redo()          if w else None)
-        bind("cut",         lambda w: w.cut()           if w else None)
-        bind("copy",        lambda w: w.copy()          if w else None)
-        bind("paste",       lambda w: w.paste()         if w else None)
-        bind("select-all",  lambda w: w.select_all()    if w else None)
-        bind("show-find",   lambda w: w.show_find()     if w else None)
-        bind("show-replace",lambda w: w.show_replace()  if w else None)
-        bind("find-next",   lambda w: w.find_next()     if w else None)
-        bind("find-prev",   lambda w: w.find_prev()     if w else None)
+        bind("close-tab", lambda w: w.close_tab() if w else None)
+        bind("rename-tab", lambda w: w.prompt_rename() if w else None)
+        bind("quit", lambda w: self.quit())
+        bind("undo", lambda w: w.undo() if w else None)
+        bind("redo", lambda w: w.redo() if w else None)
+        bind("cut", lambda w: w.cut() if w else None)
+        bind("copy", lambda w: w.copy() if w else None)
+        bind("paste", lambda w: w.paste() if w else None)
+        bind("select-all", lambda w: w.select_all() if w else None)
+        bind("show-find", lambda w: w.show_find() if w else None)
+        bind("show-replace", lambda w: w.show_replace() if w else None)
+        bind("find-next", lambda w: w.find_next() if w else None)
+        bind("find-prev", lambda w: w.find_prev() if w else None)
 
-        # 侧栏折叠 Action
         sidebar_act = Gio.SimpleAction.new_stateful(
             "toggle-sidebar", None, GLib.Variant.new_boolean(True)
         )
         sidebar_act.connect("activate", self._on_toggle_sidebar)
         self.add_action(sidebar_act)
 
-        # 深色模式 Action
         dark = Gio.SimpleAction.new_stateful(
             "toggle-dark", None, GLib.Variant.new_boolean(False)
         )
         dark.connect("activate", self._on_toggle_dark)
         self.add_action(dark)
 
-        # 语言 Action
-        act = Gio.SimpleAction.new("set-lang", GLib.VariantType.new("s"))
-        act.connect("activate", lambda a, p: (
-            self.props.active_window.set_language(p.get_string())
-            if self.props.active_window else None
-        ))
-        self.add_action(act)
+        # FIX: set-lang 改成 stateful action，菜单可显示当前选中语言
+        lang_act = Gio.SimpleAction.new_stateful(
+            "set-lang", GLib.VariantType.new("s"),
+            GLib.Variant.new_string("none")
+        )
+        lang_act.connect("activate", self._on_set_lang)
+        self.add_action(lang_act)
 
     def _on_toggle_sidebar(self, action, param):
         win = self.props.active_window
         if win:
             win.toggle_sidebar()
-            action.set_state(GLib.Variant.new_boolean(win.sidebar_revealer.get_reveal_child()))
+            action.set_state(
+                GLib.Variant.new_boolean(win.sidebar_revealer.get_reveal_child())
+            )
 
     def _on_toggle_dark(self, action, param):
         win = self.props.active_window
@@ -1564,23 +1606,28 @@ class FoxNoteApp(Gtk.Application):
             win.toggle_dark()
             action.set_state(GLib.Variant.new_boolean(win.dark))
 
+    def _on_set_lang(self, action, param):
+        win = self.props.active_window
+        if win:
+            win.set_language(param.get_string())
+
     def _setup_accels(self):
-        self.set_accels_for_action("app.new",          ["<Ctrl>N"])
-        self.set_accels_for_action("app.new-window",   ["<Ctrl><Shift>N"])
-        self.set_accels_for_action("app.open",         ["<Ctrl>O"])
-        self.set_accels_for_action("app.save",         ["<Ctrl>S"])
-        self.set_accels_for_action("app.save-as",      ["<Ctrl><Shift>S"])
-        self.set_accels_for_action("app.print",        ["<Ctrl>P"])
-        self.set_accels_for_action("app.rename-tab",   ["F2"])
-        self.set_accels_for_action("app.close-tab",    ["<Ctrl>W"])
-        self.set_accels_for_action("app.quit",         ["<Ctrl>Q"])
-        self.set_accels_for_action("app.toggle-dark",  ["<Ctrl>D"])
+        self.set_accels_for_action("app.new", ["<Ctrl>N"])
+        self.set_accels_for_action("app.new-window", ["<Ctrl><Shift>N"])
+        self.set_accels_for_action("app.open", ["<Ctrl>O"])
+        self.set_accels_for_action("app.save", ["<Ctrl>S"])
+        self.set_accels_for_action("app.save-as", ["<Ctrl><Shift>S"])
+        self.set_accels_for_action("app.print", ["<Ctrl>P"])
+        self.set_accels_for_action("app.rename-tab", ["F2"])
+        self.set_accels_for_action("app.close-tab", ["<Ctrl>W"])
+        self.set_accels_for_action("app.quit", ["<Ctrl>Q"])
+        self.set_accels_for_action("app.toggle-dark", ["<Ctrl>D"])
         self.set_accels_for_action("app.toggle-sidebar", ["F9"])
-        self.set_accels_for_action("app.show-find",    ["<Ctrl>F"])
+        self.set_accels_for_action("app.show-find", ["<Ctrl>F"])
         self.set_accels_for_action("app.show-replace", ["<Ctrl>H"])
-        self.set_accels_for_action("app.toggle-wrap",  ["<Ctrl><Alt>W"])
-        self.set_accels_for_action("app.find-next",    ["F3"])
-        self.set_accels_for_action("app.find-prev",    ["<Shift>F3"])
+        self.set_accels_for_action("app.toggle-wrap", ["<Ctrl><Alt>W"])
+        self.set_accels_for_action("app.find-next", ["F3"])
+        self.set_accels_for_action("app.find-prev", ["<Shift>F3"])
 
     def do_activate(self):
         win = self.props.active_window
@@ -1611,3 +1658,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
